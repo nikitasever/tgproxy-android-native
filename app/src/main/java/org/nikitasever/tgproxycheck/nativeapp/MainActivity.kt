@@ -36,12 +36,14 @@ import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
 
-// Known-good proxy from our own scraped pool (SoliSpirit source), independently
-// confirmed reachable on this exact network via Telegram's own client without a VPN.
-// This is the reference case the Python/Telethon build failed to validate against.
-private const val TEST_SERVER = "go.pelmeshka.top"
-private const val TEST_PORT = 443
-private const val TEST_SECRET = "eeaa6a6fdb00cbaf8a0c257e6736ece98f676f2e70656c6d6573686b612e746f70"
+// Freshest fastest proxy from a scan run moments before this build, MTProto-verified
+// server-side by our own Telethon-based checker (mtproto_ms=3037, latency_ms=30).
+// The previous go.pelmeshka.top test proxy had simply died by the time it was retested —
+// confirmed independently via https://t.me/proxy?...go.pelmeshka.top — so this swaps in
+// a proxy that's known-alive right now instead of one from a stale snapshot.
+private const val TEST_SERVER = "87.58.201.74"
+private const val TEST_PORT = 853
+private const val TEST_SECRET = "ee6aa9eb2bd47d97b43be8ac203cfd3c0e7777772e676f6f676c652e636f6d"
 
 // pingProxy is a single-shot probe with no retry — a real client (TDLib's own
 // connection manager, used when the proxy is actually enabled) reconnects with
