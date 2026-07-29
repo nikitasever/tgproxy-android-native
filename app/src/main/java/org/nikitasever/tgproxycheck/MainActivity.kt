@@ -19,10 +19,9 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import dev.g000sha256.tdl.TdlClient
-import dev.g000sha256.tdl.dto.AddProxy
-import dev.g000sha256.tdl.dto.PingProxy
+import dev.g000sha256.tdl.TdlResult
+import dev.g000sha256.tdl.dto.Proxy
 import dev.g000sha256.tdl.dto.ProxyTypeMtproto
-import dev.g000sha256.tdl.dto.SetTdlibParameters
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -69,36 +68,37 @@ fun ProxyCheckScreen(filesDirPath: String) {
 private suspend fun checkProxy(filesDirPath: String): String {
     val client = TdlClient.create()
     return try {
-        client.setTdlibParameters(
-            SetTdlibParameters(
-                useTestDc = false,
-                databaseDirectory = "$filesDirPath/tdlib",
-                filesDirectory = "$filesDirPath/tdlib-files",
-                databaseEncryptionKey = ByteArray(0),
-                useFileDatabase = false,
-                useChatInfoDatabase = false,
-                useMessageDatabase = false,
-                useSecretChats = false,
-                apiId = BuildConfig.TG_API_ID,
-                apiHash = BuildConfig.TG_API_HASH,
-                systemLanguageCode = "ru",
-                deviceModel = "TgProxyCheck-native-poc",
-                systemVersion = "unknown",
-                applicationVersion = "0.1",
-            )
+        val paramsResult = client.setTdlibParameters(
+            useTestDc = false,
+            databaseDirectory = "$filesDirPath/tdlib",
+            filesDirectory = "$filesDirPath/tdlib-files",
+            databaseEncryptionKey = ByteArray(0),
+            useFileDatabase = false,
+            useChatInfoDatabase = false,
+            useMessageDatabase = false,
+            useSecretChats = false,
+            apiId = BuildConfig.TG_API_ID,
+            apiHash = BuildConfig.TG_API_HASH,
+            systemLanguageCode = "ru",
+            deviceModel = "TgProxyCheck-native-poc",
+            systemVersion = "unknown",
+            applicationVersion = "0.1",
+        )
+        if (paramsResult is TdlResult.Failure) {
+            return "FAIL: setTdlibParameters — [${paramsResult.code}] ${paramsResult.message}"
+        }
+
+        val proxy = Proxy(
+            server = TEST_SERVER,
+            port = TEST_PORT,
+            type = ProxyTypeMtproto(secret = TEST_SECRET),
         )
 
-        val proxy = client.addProxy(
-            AddProxy(
-                server = TEST_SERVER,
-                port = TEST_PORT,
-                enable = true,
-                type = ProxyTypeMtproto(secret = TEST_SECRET),
-            )
-        )
-
-        val seconds = client.pingProxy(PingProxy(proxyId = proxy.id))
-        "OK: пинг через прокси = ${seconds.seconds} c"
+        val pingResult = client.pingProxy(proxy)
+        when (pingResult) {
+            is TdlResult.Success -> "OK: пинг через прокси = ${pingResult.result.seconds} c"
+            is TdlResult.Failure -> "FAIL: pingProxy — [${pingResult.code}] ${pingResult.message}"
+        }
     } catch (e: Exception) {
         "FAIL: ${e::class.simpleName}: ${e.message}"
     } finally {
