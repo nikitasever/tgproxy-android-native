@@ -1,0 +1,5 @@
+# Copy to local.properties (gitignored) and fill in real values.
+# Same Telegram app credentials already used server-side in /opt/tgproxy-bot/config.json.
+sdk.dir=C\:\\Users\\<you>\\AppData\\Local\\Android\\Sdk
+tg.api_id=0
+tg.api_hash=
