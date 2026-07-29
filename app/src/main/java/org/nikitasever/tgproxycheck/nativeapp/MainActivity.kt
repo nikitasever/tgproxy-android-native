@@ -20,13 +20,21 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import dev.g000sha256.tdl.TdlClient
 import dev.g000sha256.tdl.TdlResult
+import dev.g000sha256.tdl.dto.ConnectionStateConnecting
+import dev.g000sha256.tdl.dto.ConnectionStateConnectingToProxy
+import dev.g000sha256.tdl.dto.ConnectionStateReady
+import dev.g000sha256.tdl.dto.ConnectionStateUpdating
+import dev.g000sha256.tdl.dto.ConnectionStateWaitingForNetwork
 import dev.g000sha256.tdl.dto.Proxy
 import dev.g000sha256.tdl.dto.ProxyTypeMtproto
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.flow.launchIn
+import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
 
 // Known-good proxy from our own scraped pool (SoliSpirit source), independently
 // confirmed reachable on this exact network via Telegram's own client without a VPN.
@@ -34,7 +42,11 @@ import kotlinx.coroutines.withTimeout
 private const val TEST_SERVER = "go.pelmeshka.top"
 private const val TEST_PORT = 443
 private const val TEST_SECRET = "eeaa6a6fdb00cbaf8a0c257e6736ece98f676f2e70656c6d6573686b612e746f70"
-private const val CHECK_TIMEOUT_MS = 20_000L
+
+// pingProxy is a single-shot probe with no retry — a real client (TDLib's own
+// connection manager, used when the proxy is actually enabled) reconnects with
+// backoff instead of failing on one dropped attempt. This gives that a chance to work.
+private const val CHECK_TIMEOUT_MS = 30_000L
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -61,54 +73,77 @@ fun ProxyCheckScreen(filesDirPath: String) {
         Text(text = status)
         Button(onClick = {
             status = "Проверяю через TDLib..."
-            scope.launch { status = checkProxy(filesDirPath) }
+            scope.launch { status = checkProxy(filesDirPath) { state -> status = state } }
         }) {
             Text("Проверить $TEST_SERVER:$TEST_PORT")
         }
     }
 }
 
-private suspend fun checkProxy(filesDirPath: String): String {
+private suspend fun checkProxy(filesDirPath: String, onState: (String) -> Unit): String = coroutineScope {
     val client = TdlClient.create()
-    return try {
-        withTimeout(CHECK_TIMEOUT_MS) {
-            val paramsResult = client.setTdlibParameters(
-                useTestDc = false,
-                databaseDirectory = "$filesDirPath/tdlib",
-                filesDirectory = "$filesDirPath/tdlib-files",
-                databaseEncryptionKey = ByteArray(0),
-                useFileDatabase = false,
-                useChatInfoDatabase = false,
-                useMessageDatabase = false,
-                useSecretChats = false,
-                apiId = BuildConfig.TG_API_ID,
-                apiHash = BuildConfig.TG_API_HASH,
-                systemLanguageCode = "ru",
-                deviceModel = "TgProxyCheck-native-poc",
-                systemVersion = "unknown",
-                applicationVersion = "0.1",
-            )
-            if (paramsResult is TdlResult.Failure) {
-                return@withTimeout "FAIL: setTdlibParameters — [${paramsResult.code}] ${paramsResult.message}"
-            }
+    val ready = CompletableDeferred<Unit>()
 
-            val proxy = Proxy(
-                server = TEST_SERVER,
-                port = TEST_PORT,
-                type = ProxyTypeMtproto(secret = TEST_SECRET),
-            )
-
-            val pingResult = client.pingProxy(proxy)
-            when (pingResult) {
-                is TdlResult.Success -> "OK: пинг через прокси = ${pingResult.result.seconds} c"
-                is TdlResult.Failure -> "FAIL: pingProxy — [${pingResult.code}] ${pingResult.message}"
+    // Must start collecting before the first request per the library's own README note.
+    // This job never completes on its own — it must be cancelled explicitly, or the
+    // enclosing coroutineScope would hang forever waiting for it to finish.
+    val collectorJob = client.connectionStateUpdates
+        .onEach { update ->
+            val label = when (update.state) {
+                is ConnectionStateWaitingForNetwork -> "Ожидание сети..."
+                is ConnectionStateConnectingToProxy -> "Подключаюсь к прокси..."
+                is ConnectionStateConnecting -> "Подключаюсь к Telegram..."
+                is ConnectionStateUpdating -> "Синхронизация..."
+                is ConnectionStateReady -> "Соединение установлено"
+                else -> "..."
             }
+            onState(label)
+            if (update.state is ConnectionStateReady) ready.complete(Unit)
         }
-    } catch (e: TimeoutCancellationException) {
-        "FAIL: таймаут ${CHECK_TIMEOUT_MS / 1000}с — TDLib не ответил (похоже на тот же сетевой затык, что был в Python-версии)"
+        .launchIn(this)
+
+    try {
+        val paramsResult = client.setTdlibParameters(
+            useTestDc = false,
+            databaseDirectory = "$filesDirPath/tdlib",
+            filesDirectory = "$filesDirPath/tdlib-files",
+            databaseEncryptionKey = ByteArray(0),
+            useFileDatabase = false,
+            useChatInfoDatabase = false,
+            useMessageDatabase = false,
+            useSecretChats = false,
+            apiId = BuildConfig.TG_API_ID,
+            apiHash = BuildConfig.TG_API_HASH,
+            systemLanguageCode = "ru",
+            deviceModel = "TgProxyCheck-native-poc",
+            systemVersion = "unknown",
+            applicationVersion = "0.1",
+        )
+        if (paramsResult is TdlResult.Failure) {
+            return@coroutineScope "FAIL: setTdlibParameters — [${paramsResult.code}] ${paramsResult.message}"
+        }
+
+        val proxy = Proxy(
+            server = TEST_SERVER,
+            port = TEST_PORT,
+            type = ProxyTypeMtproto(secret = TEST_SECRET),
+        )
+
+        val addResult = client.addProxy(proxy = proxy, enable = true, comment = "native-poc-test")
+        if (addResult is TdlResult.Failure) {
+            return@coroutineScope "FAIL: addProxy — [${addResult.code}] ${addResult.message}"
+        }
+
+        val succeeded = withTimeoutOrNull(CHECK_TIMEOUT_MS) { ready.await() } != null
+        if (succeeded) {
+            "OK: соединение через прокси установлено (ConnectionStateReady) — реальная сессия, не разовый пинг"
+        } else {
+            "FAIL: за ${CHECK_TIMEOUT_MS / 1000}с TDLib с ретраями так и не дошёл до готовности"
+        }
     } catch (e: Exception) {
         "FAIL: ${e::class.simpleName}: ${e.message}"
     } finally {
+        collectorJob.cancel()
         client.close()
     }
 }
