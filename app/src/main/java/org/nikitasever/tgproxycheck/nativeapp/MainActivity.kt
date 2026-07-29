@@ -1,4 +1,4 @@
-package org.nikitasever.tgproxycheck
+package org.nikitasever.tgproxycheck.nativeapp
 
 import android.os.Bundle
 import androidx.activity.ComponentActivity
@@ -24,7 +24,9 @@ import dev.g000sha256.tdl.dto.Proxy
 import dev.g000sha256.tdl.dto.ProxyTypeMtproto
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeout
 
 // Known-good proxy from our own scraped pool (SoliSpirit source), independently
 // confirmed reachable on this exact network via Telegram's own client without a VPN.
@@ -32,6 +34,7 @@ import kotlinx.coroutines.launch
 private const val TEST_SERVER = "go.pelmeshka.top"
 private const val TEST_PORT = 443
 private const val TEST_SECRET = "eeaa6a6fdb00cbaf8a0c257e6736ece98f676f2e70656c6d6573686b612e746f70"
+private const val CHECK_TIMEOUT_MS = 20_000L
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -68,37 +71,41 @@ fun ProxyCheckScreen(filesDirPath: String) {
 private suspend fun checkProxy(filesDirPath: String): String {
     val client = TdlClient.create()
     return try {
-        val paramsResult = client.setTdlibParameters(
-            useTestDc = false,
-            databaseDirectory = "$filesDirPath/tdlib",
-            filesDirectory = "$filesDirPath/tdlib-files",
-            databaseEncryptionKey = ByteArray(0),
-            useFileDatabase = false,
-            useChatInfoDatabase = false,
-            useMessageDatabase = false,
-            useSecretChats = false,
-            apiId = BuildConfig.TG_API_ID,
-            apiHash = BuildConfig.TG_API_HASH,
-            systemLanguageCode = "ru",
-            deviceModel = "TgProxyCheck-native-poc",
-            systemVersion = "unknown",
-            applicationVersion = "0.1",
-        )
-        if (paramsResult is TdlResult.Failure) {
-            return "FAIL: setTdlibParameters — [${paramsResult.code}] ${paramsResult.message}"
-        }
+        withTimeout(CHECK_TIMEOUT_MS) {
+            val paramsResult = client.setTdlibParameters(
+                useTestDc = false,
+                databaseDirectory = "$filesDirPath/tdlib",
+                filesDirectory = "$filesDirPath/tdlib-files",
+                databaseEncryptionKey = ByteArray(0),
+                useFileDatabase = false,
+                useChatInfoDatabase = false,
+                useMessageDatabase = false,
+                useSecretChats = false,
+                apiId = BuildConfig.TG_API_ID,
+                apiHash = BuildConfig.TG_API_HASH,
+                systemLanguageCode = "ru",
+                deviceModel = "TgProxyCheck-native-poc",
+                systemVersion = "unknown",
+                applicationVersion = "0.1",
+            )
+            if (paramsResult is TdlResult.Failure) {
+                return@withTimeout "FAIL: setTdlibParameters — [${paramsResult.code}] ${paramsResult.message}"
+            }
 
-        val proxy = Proxy(
-            server = TEST_SERVER,
-            port = TEST_PORT,
-            type = ProxyTypeMtproto(secret = TEST_SECRET),
-        )
+            val proxy = Proxy(
+                server = TEST_SERVER,
+                port = TEST_PORT,
+                type = ProxyTypeMtproto(secret = TEST_SECRET),
+            )
 
-        val pingResult = client.pingProxy(proxy)
-        when (pingResult) {
-            is TdlResult.Success -> "OK: пинг через прокси = ${pingResult.result.seconds} c"
-            is TdlResult.Failure -> "FAIL: pingProxy — [${pingResult.code}] ${pingResult.message}"
+            val pingResult = client.pingProxy(proxy)
+            when (pingResult) {
+                is TdlResult.Success -> "OK: пинг через прокси = ${pingResult.result.seconds} c"
+                is TdlResult.Failure -> "FAIL: pingProxy — [${pingResult.code}] ${pingResult.message}"
+            }
         }
+    } catch (e: TimeoutCancellationException) {
+        "FAIL: таймаут ${CHECK_TIMEOUT_MS / 1000}с — TDLib не ответил (похоже на тот же сетевой затык, что был в Python-версии)"
     } catch (e: Exception) {
         "FAIL: ${e::class.simpleName}: ${e.message}"
     } finally {
