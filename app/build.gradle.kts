@@ -15,14 +15,15 @@ val localProps = Properties().apply {
 }
 
 android {
-    namespace = "org.nikitasever.tgproxycheck.native"
+    namespace = "org.nikitasever.tgproxycheck.nativeapp"
     compileSdk = 37
 
     defaultConfig {
         // Deliberately distinct from the Python app's org.nikitasever.tgproxycheck —
         // same applicationId with a different signing key makes Android refuse to
         // install ("app not installed"), since they'd collide as the "same" app.
-        applicationId = "org.nikitasever.tgproxycheck.native"
+        // ("native" alone is a reserved Java keyword, hence "nativeapp".)
+        applicationId = "org.nikitasever.tgproxycheck.nativeapp"
         minSdk = 24
         targetSdk = 37
         versionCode = 2
