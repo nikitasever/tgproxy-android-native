@@ -15,15 +15,18 @@ val localProps = Properties().apply {
 }
 
 android {
-    namespace = "org.nikitasever.tgproxycheck"
+    namespace = "org.nikitasever.tgproxycheck.native"
     compileSdk = 37
 
     defaultConfig {
-        applicationId = "org.nikitasever.tgproxycheck"
+        // Deliberately distinct from the Python app's org.nikitasever.tgproxycheck —
+        // same applicationId with a different signing key makes Android refuse to
+        // install ("app not installed"), since they'd collide as the "same" app.
+        applicationId = "org.nikitasever.tgproxycheck.native"
         minSdk = 24
         targetSdk = 37
-        versionCode = 1
-        versionName = "0.1-native-poc"
+        versionCode = 2
+        versionName = "0.1.1-native-poc"
         buildConfigField("int", "TG_API_ID", localProps.getProperty("tg.api_id", "0"))
         buildConfigField("String", "TG_API_HASH", "\"${localProps.getProperty("tg.api_hash", "")}\"")
     }
