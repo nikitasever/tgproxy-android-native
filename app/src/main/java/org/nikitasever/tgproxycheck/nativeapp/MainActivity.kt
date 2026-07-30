@@ -18,6 +18,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
@@ -27,6 +28,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.unit.dp
+import androidx.core.content.FileProvider
+import java.io.File
 import dev.g000sha256.tdl.TdlClient
 import dev.g000sha256.tdl.TdlResult
 import dev.g000sha256.tdl.dto.ConnectionStateReady
@@ -123,6 +126,47 @@ private fun Candidate.toTelegramProxyUrl(): String =
 
 data class AliveHit(val candidate: Candidate, val pingMs: Long)
 
+private const val GITHUB_LATEST_RELEASE_URL =
+    "https://api.github.com/repos/nikitasever/tgproxy-android-native/releases/latest"
+
+data class UpdateInfo(val version: String, val downloadUrl: String)
+
+private suspend fun checkForUpdate(): UpdateInfo? = withContext(Dispatchers.IO) {
+    try {
+        val connection = java.net.URL(GITHUB_LATEST_RELEASE_URL).openConnection() as HttpsURLConnection
+        connection.setRequestProperty("Accept", "application/vnd.github+json")
+        connection.connectTimeout = 10_000
+        connection.readTimeout = 10_000
+        val body = connection.inputStream.bufferedReader().use { it.readText() }
+        val root = org.json.JSONObject(body)
+        val tagName = root.getString("tag_name").removePrefix("v")
+        if (tagName == BuildConfig.VERSION_NAME) return@withContext null
+
+        val assets = root.getJSONArray("assets")
+        var downloadUrl: String? = null
+        for (i in 0 until assets.length()) {
+            val asset = assets.getJSONObject(i)
+            if (asset.getString("name") == "app-debug.apk") {
+                downloadUrl = asset.getString("browser_download_url")
+                break
+            }
+        }
+        downloadUrl?.let { UpdateInfo(version = tagName, downloadUrl = it) }
+    } catch (e: Exception) {
+        null
+    }
+}
+
+private suspend fun downloadApk(url: String, destFile: File): Unit = withContext(Dispatchers.IO) {
+    val connection = java.net.URL(url).openConnection() as HttpsURLConnection
+    connection.connectTimeout = 15_000
+    connection.readTimeout = 30_000
+    connection.instanceFollowRedirects = true
+    connection.inputStream.use { input ->
+        destFile.outputStream().use { output -> input.copyTo(output) }
+    }
+}
+
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -143,7 +187,60 @@ fun ProxyCheckScreen(filesDirPath: String) {
     val aliveResults = remember { mutableStateListOf<AliveHit>() }
     val context = LocalContext.current
 
+    var updateInfo by remember { mutableStateOf<UpdateInfo?>(null) }
+    var updateStatus by remember { mutableStateOf<String?>(null) }
+
+    LaunchedEffect(Unit) {
+        updateInfo = checkForUpdate()
+    }
+
     Column(modifier = Modifier.fillMaxSize().padding(24.dp)) {
+        updateInfo?.let { info ->
+            Text(text = "Доступно обновление: v${info.version}${updateStatus?.let { " — $it" } ?: ""}")
+            Button(
+                modifier = Modifier.fillMaxWidth().padding(top = 8.dp, bottom = 16.dp),
+                onClick = {
+                    val needsInstallPermission = android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O &&
+                        !context.packageManager.canRequestPackageInstalls()
+                    if (needsInstallPermission) {
+                        updateStatus = "нужно разрешение на установку — открываю настройки"
+                        context.startActivity(
+                            Intent(
+                                android.provider.Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                                Uri.parse("package:${context.packageName}"),
+                            )
+                        )
+                        return@Button
+                    }
+                    scope.launch {
+                        updateStatus = "скачиваю..."
+                        try {
+                            val updatesDir = File(context.cacheDir, "updates").apply { mkdirs() }
+                            val apkFile = File(updatesDir, "update.apk")
+                            downloadApk(info.downloadUrl, apkFile)
+                            updateStatus = "устанавливаю..."
+                            val uri = FileProvider.getUriForFile(
+                                context,
+                                "org.nikitasever.tgproxycheck.nativeapp.fileprovider",
+                                apkFile,
+                            )
+                            val installIntent = Intent(Intent.ACTION_VIEW).apply {
+                                setDataAndType(uri, "application/vnd.android.package-archive")
+                                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                            }
+                            context.startActivity(installIntent)
+                        } catch (e: Exception) {
+                            updateStatus = "FAIL: ${e::class.simpleName}: ${e.message}"
+                        }
+                    }
+                },
+            ) {
+                Text("Обновить")
+            }
+            Divider(modifier = Modifier.padding(bottom = 12.dp))
+        }
+
         Text(text = status)
 
         Button(

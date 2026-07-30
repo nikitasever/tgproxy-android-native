@@ -3,7 +3,7 @@ name: Build native POC APK
 on:
   workflow_dispatch:
   push:
-    branches: [main]
+    branches: [master]
 
 jobs:
   build:
@@ -23,6 +23,11 @@ jobs:
           tg.api_id=${{ secrets.TG_API_ID }}
           tg.api_hash=${{ secrets.TG_API_HASH }}
           EOF
+
+      - name: Write stable debug keystore
+        run: |
+          mkdir -p keystore
+          echo "${{ secrets.NATIVE_DEBUG_KEYSTORE_B64 }}" | base64 -d > keystore/debug-native.jks
 
       - uses: gradle/actions/setup-gradle@v4
         with:

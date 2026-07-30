@@ -14,6 +14,13 @@ val localProps = Properties().apply {
     if (f.exists()) f.inputStream().use { load(it) }
 }
 
+// Gradle's default debug signing config auto-generates ~/.android/debug.keystore
+// fresh on every machine/CI runner, so every CI build was signed with a different
+// key - Android refuses to install an "update" signed with a different key than
+// the currently-installed one (same failure mode as the applicationId collision
+// earlier). This pins a stable keystore (written from a secret in CI) instead.
+val stableDebugKeystore = rootProject.file("keystore/debug-native.jks")
+
 android {
     namespace = "org.nikitasever.tgproxycheck.nativeapp"
     compileSdk = 37
@@ -30,13 +37,29 @@ android {
         // silently keep the already-installed APK instead of updating (confirmed:
         // v0.1.2 through v0.3.0 all shipped with this stuck at 2, so several
         // "updated" installs were actually still running old code).
-        versionCode = 11
-        versionName = "0.4.1-native-poc"
+        versionCode = 12
+        versionName = "0.5.0-native-poc"
         buildConfigField("int", "TG_API_ID", localProps.getProperty("tg.api_id", "0"))
         buildConfigField("String", "TG_API_HASH", "\"${localProps.getProperty("tg.api_hash", "")}\"")
     }
 
+    if (stableDebugKeystore.exists()) {
+        signingConfigs {
+            create("stableDebug") {
+                storeFile = stableDebugKeystore
+                storePassword = "tgproxynative2026"
+                keyAlias = "tgproxynativedebug"
+                keyPassword = "tgproxynative2026"
+            }
+        }
+    }
+
     buildTypes {
+        getByName("debug") {
+            if (stableDebugKeystore.exists()) {
+                signingConfig = signingConfigs.getByName("stableDebug")
+            }
+        }
         release {
             isMinifyEnabled = false
         }
