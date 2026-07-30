@@ -26,8 +26,12 @@ android {
         applicationId = "org.nikitasever.tgproxycheck.nativeapp"
         minSdk = 24
         targetSdk = 37
-        versionCode = 2
-        versionName = "0.1.1-native-poc"
+        // Bump both on every release build - an unchanged versionCode makes Android
+        // silently keep the already-installed APK instead of updating (confirmed:
+        // v0.1.2 through v0.3.0 all shipped with this stuck at 2, so several
+        // "updated" installs were actually still running old code).
+        versionCode = 9
+        versionName = "0.3.0-native-poc"
         buildConfigField("int", "TG_API_ID", localProps.getProperty("tg.api_id", "0"))
         buildConfigField("String", "TG_API_HASH", "\"${localProps.getProperty("tg.api_hash", "")}\"")
     }
