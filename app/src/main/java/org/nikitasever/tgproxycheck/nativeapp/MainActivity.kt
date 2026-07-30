@@ -77,7 +77,7 @@ class MainActivity : ComponentActivity() {
 fun ProxyCheckScreen(filesDirPath: String) {
     var status by remember { mutableStateOf("Готово") }
     val scope = remember { CoroutineScope(Dispatchers.Main) }
-    val aliveResults = remember { mutableStateListOf() }
+    val aliveResults = remember { mutableStateListOf<String>() }
 
     Column(modifier = Modifier.fillMaxSize().padding(24.dp)) {
         Text(text = status)
