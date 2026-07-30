@@ -119,8 +119,15 @@ private fun classifyDomain(domain: String?): String {
 // trusted as the pool to draw from; the raw, unfiltered candidates.json pool (tested
 // live from this phone) is the only reliable ground truth.
 private const val REGULAR_FILL_LIMIT = 350
-private const val SCAN_CONCURRENCY = 16
+// Was 16. Each candidate spins up a fully separate native TDLib client (own DB,
+// own threads); at 16-way concurrency across a 448-candidate run the native/JVM
+// heap pressure is very plausibly what killed the process around candidate ~49
+// in the field (see SCAN_TAG logging + the Throwable-catching added around
+// checkViaConnection below). Lowering concurrency is a cheap way to reduce peak
+// resource usage in addition to the crash-hardening.
+private const val SCAN_CONCURRENCY = 10
 private const val PER_PROXY_TIMEOUT_MS = 6_000L
+private const val SCAN_TAG = "TgProxyScan"
 
 data class Candidate(
     val server: String,
@@ -159,15 +166,22 @@ private fun isProtectedDomain(domain: String?): Boolean {
 private fun Candidate.toTelegramProxyUrl(): String =
     "tg://proxy?server=$server&port=$port&secret=$secret"
 
-// downloadKbps/uploadKbps come from TDLib's own getNetworkStatistics() sampled
-// right after the proxy connection reaches Ready - i.e. real bytes TDLib
-// actually sent/received through this proxy (protocol handshake + the initial
-// help.getConfig/init calls TDLib makes even before login). It is NOT a bulk
-// throughput test: no login happens in this scan, so no file is ever
-// transferred - the sample is just a few KB, so the number is dominated by
-// round-trip latency rather than sustained bandwidth. Still an honest,
-// real-bytes-over-this-real-connection measurement, just a small one - see
-// checkViaConnection(). Null if the stats call itself failed.
+// downloadKbps/uploadKbps used to be sampled via TDLib's getNetworkStatistics()
+// right after ConnectionStateReady. That was removed in 0.7.1: TDLib's
+// NetworkStatistics only ever accumulates entries of type
+// NetworkStatisticsEntryCall (voice/video calls) or NetworkStatisticsEntryFile
+// (file up/downloads) - see td_api.tql's networkStatisticsEntryCall /
+// networkStatisticsEntryFile, the only two variants of NetworkStatisticsEntry.
+// This mass-scan never logs in and never transfers a file or places a call, so
+// there is structurally nothing for TDLib to record: the entries list is
+// always empty and the metric always reads 0.0/0.0, regardless of
+// onlyCurrent or sampling timing - it's not a race, the data source just
+// doesn't cover pre-auth handshake bytes. Rather than ship a metric that
+// always shows zero, it was removed; pingMs (time from adding the proxy to
+// ConnectionStateReady) remains the honest signal for "how fast does this
+// proxy connect". Fields kept (always null now) so old persisted
+// last_scan_results.json files with real values still load without a schema
+// change.
 data class AliveHit(
     val candidate: Candidate,
     val pingMs: Long,
@@ -213,8 +227,20 @@ private fun saveLastScanResults(filesDirPath: String, totalChecked: Int, hits: L
             resultsJson.put(o)
         }
         root.put("results", resultsJson)
-        File(filesDirPath, LAST_SCAN_FILE_NAME).writeText(root.toString())
-    } catch (e: Exception) {
+        // Write to a temp file and rename over the real one so a process death
+        // mid-write (e.g. the OOM scenario documented on checkViaConnection)
+        // can never leave a half-written/corrupt last_scan_results.json behind
+        // for the next cold start to choke on.
+        val target = File(filesDirPath, LAST_SCAN_FILE_NAME)
+        val tmp = File(filesDirPath, "$LAST_SCAN_FILE_NAME.tmp")
+        tmp.writeText(root.toString())
+        if (!tmp.renameTo(target)) {
+            // renameTo can fail across some filesystems/edge cases; fall back to a
+            // direct write rather than silently losing the scan results.
+            target.writeText(root.toString())
+            tmp.delete()
+        }
+    } catch (e: Throwable) {
         android.util.Log.e(UPDATE_CHECK_TAG, "saveLastScanResults failed: ${e.message}", e)
     }
 }
@@ -246,7 +272,7 @@ private fun loadLastScanResults(filesDirPath: String): LastScanSnapshot? {
             totalChecked = root.optInt("totalChecked", hits.size),
             hits = hits,
         )
-    } catch (e: Exception) {
+    } catch (e: Throwable) {
         android.util.Log.e(UPDATE_CHECK_TAG, "loadLastScanResults failed: ${e.message}", e)
         null
     }
@@ -441,15 +467,25 @@ fun ProxyCheckScreen(filesDirPath: String) {
                 lastScanInfo = null
                 status = "Загружаю список кандидатов..."
                 scope.launch {
-                    runMassScan(
-                        filesDirPath,
-                        onStatus = { status = it },
-                        onAlive = { aliveResults.add(it) },
-                        onComplete = { totalChecked ->
-                            totalCheckedLast = totalChecked
-                            saveLastScanResults(filesDirPath, totalChecked, aliveResults.toList())
-                        },
-                    )
+                    // Belt-and-suspenders: runMassScan/checkViaConnection now catch
+                    // Throwable internally so one bad candidate can't take the whole
+                    // scan down, but this outer catch means even a truly unexpected
+                    // failure surfaces as a status message instead of crashing the
+                    // Activity's UI coroutine scope.
+                    try {
+                        runMassScan(
+                            filesDirPath,
+                            onStatus = { status = it },
+                            onAlive = { aliveResults.add(it) },
+                            onComplete = { totalChecked ->
+                                totalCheckedLast = totalChecked
+                                saveLastScanResults(filesDirPath, totalChecked, aliveResults.toList())
+                            },
+                        )
+                    } catch (e: Throwable) {
+                        android.util.Log.e(SCAN_TAG, "runMassScan crashed: ${e::class.simpleName}: ${e.message}", e)
+                        status = "FAIL: сканирование прервано — ${e::class.simpleName}: ${e.message}"
+                    }
                 }
             },
         ) {
@@ -468,8 +504,12 @@ fun ProxyCheckScreen(filesDirPath: String) {
 
         fun hitLine(hit: AliveHit): String {
             val tag = if (hit.candidate.isProtectedDomain) " [защищённый домен]" else ""
+            // Speed (КБ/с) metric was removed in 0.7.1 - it always read 0.0/0.0 for
+            // structural reasons (see AliveHit doc comment), so it's dishonest to show.
+            // Only show it for legacy persisted results from before the removal that
+            // happen to still have real (non-null) values loaded from disk.
             val speedText = if (hit.downloadKbps != null && hit.uploadKbps != null) {
-                " — ↓%.1f/↑%.1f КБ/с (при подключении)".format(hit.downloadKbps, hit.uploadKbps)
+                " — ↓%.1f/↑%.1f КБ/с (устаревшие данные)".format(hit.downloadKbps, hit.uploadKbps)
             } else ""
             return "✓ ${hit.candidate.server}:${hit.candidate.port}$tag — ${hit.pingMs}мс$speedText — добавить в Telegram"
         }
@@ -563,19 +603,41 @@ private suspend fun runMassScan(
             "защищённых доменов: ${protected.size}, проверяю ${subset.size}..."
     )
 
-    var checked = 0
-    var alive = 0
+    // Plain Int++ from multiple concurrent coroutines (SCAN_CONCURRENCY-way, on
+    // Dispatchers.Default so genuinely multi-threaded) is a data race; use atomics
+    // so the "Проверено N/M" counter is actually accurate.
+    val checked = java.util.concurrent.atomic.AtomicInteger(0)
+    val alive = java.util.concurrent.atomic.AtomicInteger(0)
     val semaphore = Semaphore(SCAN_CONCURRENCY)
 
+    // A single candidate throwing used to be able to take the whole scan (and the
+    // app) down with it: `async { }` inside `coroutineScope { }` propagates any
+    // uncaught exception from a child up through the whole scope, cancelling every
+    // other in-flight candidate and rethrowing out of runMassScan - and since the
+    // caller (scope.launch in ProxyCheckScreen) has no CoroutineExceptionHandler,
+    // that crashes the whole app. checkViaConnection now catches Throwable
+    // internally, but this outer catch is a second line of defence in case
+    // something throws before/after that (e.g. AtomicInteger ops, onAlive/onStatus
+    // callbacks) so one bad candidate never kills the other 447.
     coroutineScope {
         subset.mapIndexed { index, candidate ->
             async {
                 semaphore.acquire()
                 try {
-                    val result = checkViaConnection(filesDirPath, index, candidate)
-                    checked++
+                    val result = try {
+                        checkViaConnection(filesDirPath, index, candidate)
+                    } catch (e: Throwable) {
+                        android.util.Log.e(
+                            SCAN_TAG,
+                            "candidate #$index (${candidate.server}:${candidate.port}) crashed the check: " +
+                                "${e::class.simpleName}: ${e.message}",
+                            e,
+                        )
+                        null
+                    }
+                    val checkedNow = checked.incrementAndGet()
                     if (result != null) {
-                        alive++
+                        val aliveNow = alive.incrementAndGet()
                         onAlive(
                             AliveHit(
                                 candidate = candidate,
@@ -584,8 +646,10 @@ private suspend fun runMassScan(
                                 uploadKbps = result.uploadKbps,
                             )
                         )
+                        onStatus("Проверено $checkedNow/${subset.size}, живых сейчас: $aliveNow")
+                    } else {
+                        onStatus("Проверено $checkedNow/${subset.size}, живых сейчас: ${alive.get()}")
                     }
-                    onStatus("Проверено $checked/${subset.size}, живых сейчас: $alive")
                 } finally {
                     semaphore.release()
                 }
@@ -593,28 +657,57 @@ private suspend fun runMassScan(
         }.awaitAll()
     }
 
-    onStatus("Готово: $alive из ${subset.size} живы прямо сейчас (сервер верифицировал все ${subset.size} ранее)")
+    onStatus("Готово: ${alive.get()} из ${subset.size} живы прямо сейчас (сервер верифицировал все ${subset.size} ранее)")
     onComplete(subset.size)
 }
 
 private data class ConnectResult(val pingMs: Long, val downloadKbps: Double?, val uploadKbps: Double?)
 
+// Each call creates its own isolated native TDLib client + on-disk DB directory.
+// Root-caused crash (v0.7.0-native-poc): a couple of things compounded under a
+// 448-candidate / 16-way-concurrent scan:
+//  1. TdlClient.create() (and the TDLib calls after it) can fail with an
+//     OutOfMemoryError under memory pressure from many concurrent native
+//     clients - OutOfMemoryError is an Error, not an Exception, so the old
+//     `catch (e: Exception)` here did NOT catch it. An uncaught Error/Exception
+//     from inside `async { }` propagates up through the parent `coroutineScope`
+//     in runMassScan and kills the entire scan (and, since nothing upstream
+//     installs a CoroutineExceptionHandler, the whole app) - matching the
+//     observed "died partway through, at candidate ~49/448" symptom exactly.
+//  2. tdlib-scan-$index / tdlib-scan-$index-files directories were never
+//     deleted, so every run left behind TDLib's sqlite db/wal/journal files;
+//     a run that died mid-scan (crash, or the user force-closing it) could
+//     leave a stale lock on one of those directories, which would plausibly
+//     make the *next* attempt to open the same directory hang or fail - and
+//     "clear the app cache first" (which wipes filesDir) is exactly the fix
+//     that would clear such a stale lock, matching what the user had to do.
+// Fix: catch Throwable (not just Exception) around the whole client lifecycle,
+// log every failure so a real crash is diagnosable from logcat next time
+// instead of silently swallowed, and delete each candidate's scan directories
+// immediately after that candidate's check finishes so nothing accumulates or
+// goes stale across a run.
 private suspend fun checkViaConnection(
     filesDirPath: String,
     index: Int,
     candidate: Candidate,
 ): ConnectResult? = withContext(Dispatchers.Default) {
     coroutineScope {
-        val client = TdlClient.create()
-        val ready = CompletableDeferred<Unit>()
-        val collectorJob = client.connectionStateUpdates
-            .onEach { update -> if (update.state is ConnectionStateReady) ready.complete(Unit) }
-            .launchIn(this)
+        val dbDir = File(filesDirPath, "tdlib-scan-$index")
+        val filesDirForClient = File(filesDirPath, "tdlib-scan-$index-files")
+        var client: TdlClient? = null
+        var collectorJob: kotlinx.coroutines.Job? = null
         try {
-            val paramsResult = client.setTdlibParameters(
+            client = TdlClient.create()
+            val localClient = client
+            val ready = CompletableDeferred<Unit>()
+            collectorJob = localClient.connectionStateUpdates
+                .onEach { update -> if (update.state is ConnectionStateReady) ready.complete(Unit) }
+                .launchIn(this)
+
+            val paramsResult = localClient.setTdlibParameters(
                 useTestDc = false,
-                databaseDirectory = "$filesDirPath/tdlib-scan-$index",
-                filesDirectory = "$filesDirPath/tdlib-scan-$index-files",
+                databaseDirectory = dbDir.absolutePath,
+                filesDirectory = filesDirForClient.absolutePath,
                 databaseEncryptionKey = ByteArray(0),
                 useFileDatabase = false,
                 useChatInfoDatabase = false,
@@ -631,7 +724,7 @@ private suspend fun checkViaConnection(
 
             val proxyType: ProxyType = ProxyTypeMtproto(secret = candidate.secret)
             val proxy = Proxy(server = candidate.server, port = candidate.port, type = proxyType)
-            val addResult = client.addProxy(proxy = proxy, enable = true, comment = "mass-scan")
+            val addResult = localClient.addProxy(proxy = proxy, enable = true, comment = "mass-scan")
             if (addResult is TdlResult.Failure) return@coroutineScope null
 
             val start = android.os.SystemClock.elapsedRealtime()
@@ -639,42 +732,35 @@ private suspend fun checkViaConnection(
             if (!reached) return@coroutineScope null
             val pingMs = android.os.SystemClock.elapsedRealtime() - start
 
-            // Real bytes TDLib actually pushed through this proxy connection to get
-            // to Ready (protocol handshake + its initial pre-auth calls) - see the
-            // AliveHit doc comment for why this is honest but necessarily small.
-            val (downloadKbps, uploadKbps) = try {
-                when (val statsResult = client.getNetworkStatistics(onlyCurrent = true)) {
-                    is TdlResult.Success -> {
-                        var sent = 0L
-                        var received = 0L
-                        statsResult.result.entries.forEach { entry ->
-                            when (entry) {
-                                is dev.g000sha256.tdl.dto.NetworkStatisticsEntryCall -> {
-                                    sent += entry.sentBytes
-                                    received += entry.receivedBytes
-                                }
-                                is dev.g000sha256.tdl.dto.NetworkStatisticsEntryFile -> {
-                                    sent += entry.sentBytes
-                                    received += entry.receivedBytes
-                                }
-                                else -> Unit
-                            }
-                        }
-                        val seconds = (pingMs / 1000.0).coerceAtLeast(0.05)
-                        Pair(received / 1024.0 / seconds, sent / 1024.0 / seconds)
-                    }
-                    is TdlResult.Failure -> Pair(null, null)
-                }
-            } catch (e: Exception) {
-                Pair(null, null)
-            }
-
-            ConnectResult(pingMs = pingMs, downloadKbps = downloadKbps, uploadKbps = uploadKbps)
-        } catch (e: Exception) {
+            // Speed metric removed here (see AliveHit doc comment): TDLib's
+            // NetworkStatistics never records pre-auth handshake bytes, so it
+            // always came back 0.0/0.0 and was worse than showing nothing.
+            ConnectResult(pingMs = pingMs, downloadKbps = null, uploadKbps = null)
+        } catch (e: Throwable) {
+            android.util.Log.e(
+                SCAN_TAG,
+                "checkViaConnection #$index (${candidate.server}:${candidate.port}) failed: " +
+                    "${e::class.simpleName}: ${e.message}",
+                e,
+            )
             null
         } finally {
-            collectorJob.cancel()
-            client.close()
+            try {
+                collectorJob?.cancel()
+            } catch (e: Throwable) {
+                android.util.Log.e(SCAN_TAG, "collectorJob.cancel #$index failed: ${e.message}", e)
+            }
+            try {
+                client?.close()
+            } catch (e: Throwable) {
+                android.util.Log.e(SCAN_TAG, "client.close #$index failed: ${e.message}", e)
+            }
+            try {
+                dbDir.deleteRecursively()
+                filesDirForClient.deleteRecursively()
+            } catch (e: Throwable) {
+                android.util.Log.e(SCAN_TAG, "cleanup of scan dirs #$index failed: ${e.message}", e)
+            }
         }
     }
 }
