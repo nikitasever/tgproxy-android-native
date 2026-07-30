@@ -47,18 +47,65 @@ import javax.net.ssl.HttpsURLConnection
 import javax.net.ssl.SSLContext
 import javax.net.ssl.X509TrustManager
 
-// The server's own results.json endpoint (self-signed cert, same trust-all
-// approach the Python checker already uses server-side for its own requests).
+// The server's own endpoints (self-signed cert, same trust-all approach the
+// Python checker already uses server-side for its own requests).
 private const val RESULTS_URL =
     "https://77.110.98.222:8765/results.json?token=M2Pxr2BUvkbrS-9CSu40D2CFwwgY0rxY"
+private const val CANDIDATES_URL =
+    "https://77.110.98.222:8765/candidates.json?token=M2Pxr2BUvkbrS-9CSu40D2CFwwgY0rxY"
 
-// Scan only the fastest-verified subset — enough to see a real alive-rate signal
-// without an excessively long single test run.
-private const val SCAN_LIMIT = 60
-private const val SCAN_CONCURRENCY = 6
-private const val PER_PROXY_TIMEOUT_MS = 12_000L
+// Proxies masquerading (via FakeTLS) as one of these can't be blocked wholesale by an
+// ISP without breaking huge amounts of legitimate traffic, so they survive targeted DPI
+// blocking far better than ones fronting some random low-traffic filler domain — see
+// domain_priority.py on the server for how this was discovered.
+private val PROTECTED_DOMAIN_KEYWORDS = listOf(
+    "google", "gstatic", "youtube", "ytimg", "gvt1", "gvt2",
+    "yandex", "vk.com", "vk.ru", "mail.ru",
+    "cloudflare", "cloudflare-dns",
+    "amazon", "amazonaws", "awsstatic",
+    "microsoft", "azure", "windows", "office",
+    "apple", "icloud",
+    "whatsapp", "instagram", "facebook", "fbcdn",
+    "akamai", "akamaized", "fastly", "cloudfront",
+    "bing", "wikipedia", "wikimedia",
+)
 
-data class Candidate(val server: String, val port: Int, val secret: String, val mtprotoMs: Int)
+// Test every protected-domain candidate found (there are few — worth the extra time),
+// plus fill the rest of the run with the fastest server-verified regular candidates.
+private const val REGULAR_FILL_LIMIT = 80
+private const val SCAN_CONCURRENCY = 10
+private const val PER_PROXY_TIMEOUT_MS = 8_000L
+
+data class Candidate(
+    val server: String,
+    val port: Int,
+    val secret: String,
+    val mtprotoMs: Int,
+    val isProtectedDomain: Boolean,
+)
+
+private fun decodeFakeTlsDomain(secret: String): String? {
+    val hex = secret.trim().lowercase()
+        .takeIf { it.matches(Regex("[0-9a-f]+")) && it.length % 2 == 0 }
+        ?: return null
+    if (!hex.startsWith("ee") || hex.length <= 2 + 32) return null
+    val domainHex = hex.substring(2 + 32)
+    if (domainHex.isEmpty() || domainHex.length % 2 != 0) return null
+    return try {
+        val bytes = ByteArray(domainHex.length / 2) { i ->
+            domainHex.substring(i * 2, i * 2 + 2).toInt(16).toByte()
+        }
+        val domain = String(bytes, Charsets.US_ASCII)
+        if (domain.any { it.code < 32 || it.code >= 127 }) null else domain
+    } catch (e: Exception) {
+        null
+    }
+}
+
+private fun isProtectedDomain(domain: String?): Boolean {
+    if (domain.isNullOrEmpty()) return false
+    return PROTECTED_DOMAIN_KEYWORDS.any { domain.contains(it) }
+}
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -92,7 +139,7 @@ fun ProxyCheckScreen(filesDirPath: String) {
                 }
             },
         ) {
-            Text("Массовое сканирование (топ $SCAN_LIMIT)")
+            Text("Массовое сканирование")
         }
 
         Divider(modifier = Modifier.padding(vertical = 12.dp))
@@ -110,15 +157,32 @@ private suspend fun runMassScan(
     onStatus: (String) -> Unit,
     onAlive: (String) -> Unit,
 ) {
-    val candidates = try {
-        fetchCandidates()
+    val verified: List<Candidate>
+    val raw: List<Candidate>
+    try {
+        verified = fetchJsonCandidates(RESULTS_URL, jsonArrayKey = "proxies")
+        raw = fetchJsonCandidates(CANDIDATES_URL, jsonArrayKey = "candidates")
     } catch (e: Exception) {
         onStatus("FAIL: не удалось получить список — ${e::class.simpleName}: ${e.message}")
         return
     }
 
-    val subset = candidates.sortedBy { it.mtprotoMs }.take(SCAN_LIMIT)
-    onStatus("Кандидатов: ${candidates.size}, проверяю топ ${subset.size}...")
+    fun key(c: Candidate) = Triple(c.server, c.port, c.secret)
+
+    // Protected-domain proxies are rare but survive DPI far better, so test every one
+    // we can find (server-verified or not) — then fill the rest of the run with the
+    // fastest ordinary candidates the server already confirmed work.
+    val protected = (verified + raw).filter { it.isProtectedDomain }.distinctBy(::key)
+    val regularFill = verified
+        .filter { !it.isProtectedDomain }
+        .sortedBy { it.mtprotoMs }
+        .take(REGULAR_FILL_LIMIT)
+    val subset = (protected + regularFill).distinctBy(::key)
+
+    onStatus(
+        "Кандидатов: ${verified.size} verified + ${raw.size} сырых, " +
+            "защищённых доменов: ${protected.size}, проверяю ${subset.size}..."
+    )
 
     var checked = 0
     var alive = 0
@@ -133,7 +197,8 @@ private suspend fun runMassScan(
                     checked++
                     if (ok) {
                         alive++
-                        onAlive("✓ ${candidate.server}:${candidate.port} (server mtproto=${candidate.mtprotoMs}мс)")
+                        val tag = if (candidate.isProtectedDomain) " [защищённый домен]" else ""
+                        onAlive("✓ ${candidate.server}:${candidate.port}$tag")
                     }
                     onStatus("Проверено $checked/${subset.size}, живых сейчас: $alive")
                 } finally {
@@ -191,33 +256,35 @@ private suspend fun checkViaConnection(
     }
 }
 
-private suspend fun fetchCandidates(): List<Candidate> = withContext(Dispatchers.IO) {
-    val trustAll = arrayOf<javax.net.ssl.TrustManager>(object : X509TrustManager {
-        override fun checkClientTrusted(chain: Array<out X509Certificate>?, authType: String?) = Unit
-        override fun checkServerTrusted(chain: Array<out X509Certificate>?, authType: String?) = Unit
-        override fun getAcceptedIssuers(): Array<X509Certificate> = arrayOf()
-    })
-    val sslContext = SSLContext.getInstance("TLS")
-    sslContext.init(null, trustAll, SecureRandom())
+private suspend fun fetchJsonCandidates(url: String, jsonArrayKey: String): List<Candidate> =
+    withContext(Dispatchers.IO) {
+        val trustAll = arrayOf<javax.net.ssl.TrustManager>(object : X509TrustManager {
+            override fun checkClientTrusted(chain: Array<out X509Certificate>?, authType: String?) = Unit
+            override fun checkServerTrusted(chain: Array<out X509Certificate>?, authType: String?) = Unit
+            override fun getAcceptedIssuers(): Array<X509Certificate> = arrayOf()
+        })
+        val sslContext = SSLContext.getInstance("TLS")
+        sslContext.init(null, trustAll, SecureRandom())
 
-    val url = java.net.URL(RESULTS_URL)
-    val connection = url.openConnection() as HttpsURLConnection
-    connection.sslSocketFactory = sslContext.socketFactory
-    connection.hostnameVerifier = javax.net.ssl.HostnameVerifier { _, _ -> true }
-    connection.connectTimeout = 15_000
-    connection.readTimeout = 15_000
+        val connection = java.net.URL(url).openConnection() as HttpsURLConnection
+        connection.sslSocketFactory = sslContext.socketFactory
+        connection.hostnameVerifier = javax.net.ssl.HostnameVerifier { _, _ -> true }
+        connection.connectTimeout = 15_000
+        connection.readTimeout = 15_000
 
-    val body = connection.inputStream.bufferedReader().use { it.readText() }
-    val root = org.json.JSONObject(body)
-    val proxiesJson: JSONArray = if (root.has("proxies")) root.getJSONArray("proxies") else JSONArray(body)
+        val body = connection.inputStream.bufferedReader().use { it.readText() }
+        val root = org.json.JSONObject(body)
+        val itemsJson: JSONArray = if (root.has(jsonArrayKey)) root.getJSONArray(jsonArrayKey) else JSONArray(body)
 
-    (0 until proxiesJson.length()).map { i ->
-        val o = proxiesJson.getJSONObject(i)
-        Candidate(
-            server = o.getString("server"),
-            port = o.getInt("port"),
-            secret = o.getString("secret"),
-            mtprotoMs = o.optInt("mtproto_ms", 999_999),
-        )
+        (0 until itemsJson.length()).map { i ->
+            val o = itemsJson.getJSONObject(i)
+            val secret = o.getString("secret")
+            Candidate(
+                server = o.getString("server"),
+                port = o.getInt("port"),
+                secret = secret,
+                mtprotoMs = o.optInt("mtproto_ms", Int.MAX_VALUE),
+                isProtectedDomain = isProtectedDomain(decodeFakeTlsDomain(secret)),
+            )
+        }
     }
-}
