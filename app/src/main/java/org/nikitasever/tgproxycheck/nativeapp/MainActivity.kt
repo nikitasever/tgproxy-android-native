@@ -70,11 +70,15 @@ private val PROTECTED_DOMAIN_KEYWORDS = listOf(
     "bing", "wikipedia", "wikimedia",
 )
 
-// Test every protected-domain candidate found (there are few — worth the extra time),
-// plus fill the rest of the run with the fastest server-verified regular candidates.
-private const val REGULAR_FILL_LIMIT = 80
-private const val SCAN_CONCURRENCY = 10
-private const val PER_PROXY_TIMEOUT_MS = 8_000L
+// The server verifies from its own VPS/datacenter IP, which some MTProxy operators
+// block outright (a common anti-scanning measure) — confirmed by hand: proxies the
+// phone connects to fine sometimes fail the server's own from-VPS check. So its
+// "verified" list under-counts what actually works for a real device and can't be
+// trusted as the pool to draw from; the raw, unfiltered candidates.json pool (tested
+// live from this phone) is the only reliable ground truth.
+private const val REGULAR_FILL_LIMIT = 350
+private const val SCAN_CONCURRENCY = 16
+private const val PER_PROXY_TIMEOUT_MS = 6_000L
 
 data class Candidate(
     val server: String,
@@ -170,13 +174,14 @@ private suspend fun runMassScan(
     fun key(c: Candidate) = Triple(c.server, c.port, c.secret)
 
     // Protected-domain proxies are rare but survive DPI far better, so test every one
-    // we can find (server-verified or not) — then fill the rest of the run with the
-    // fastest ordinary candidates the server already confirmed work.
+    // we can find (server-verified or not). For the rest: server-verified candidates
+    // go first (still a decent quality signal), but the raw unfiltered pool fills out
+    // the bulk of the run, since the server's own verification under-counts what
+    // actually works for a real device.
     val protected = (verified + raw).filter { it.isProtectedDomain }.distinctBy(::key)
-    val regularFill = verified
-        .filter { !it.isProtectedDomain }
-        .sortedBy { it.mtprotoMs }
-        .take(REGULAR_FILL_LIMIT)
+    val regularOrdered = (verified.filter { !it.isProtectedDomain }.sortedBy { it.mtprotoMs } +
+        raw.filter { !it.isProtectedDomain }).distinctBy(::key)
+    val regularFill = regularOrdered.take(REGULAR_FILL_LIMIT)
     val subset = (protected + regularFill).distinctBy(::key)
 
     onStatus(
