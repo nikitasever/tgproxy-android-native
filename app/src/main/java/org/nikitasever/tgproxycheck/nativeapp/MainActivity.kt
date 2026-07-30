@@ -26,6 +26,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.unit.dp
 import androidx.core.content.FileProvider
@@ -78,6 +79,39 @@ private val PROTECTED_DOMAIN_KEYWORDS = listOf(
     "bing", "wikipedia", "wikimedia",
 )
 
+// Same protected-domain concept, but split into rough geographic buckets for
+// grouping results in the UI - kept as a Kotlin port of the same mapping used
+// server-side in domain_priority.py (DOMAIN_CATEGORIES). Not taxonomically
+// perfect on purpose - one bucket per keyword is good enough here.
+private val DOMAIN_CATEGORIES: List<Pair<String, List<String>>> = listOf(
+    "RU" to listOf("yandex", "vk.com", "vk.ru", "mail.ru", "gosuslugi"),
+    "EU" to listOf(
+        "google", "gstatic", "youtube", "ytimg", "gvt1", "gvt2",
+        "cloudflare", "cloudflare-dns",
+        "amazon", "amazonaws", "awsstatic",
+        "microsoft", "azure", "windows", "office",
+        "apple", "icloud",
+    ),
+    "US" to listOf(
+        "whatsapp", "instagram", "facebook", "fbcdn",
+        "akamai", "akamaized", "fastly", "cloudfront",
+        "bing",
+    ),
+    // No strong signal yet in the current source pool - left ready in case
+    // Asian CDN-fronted proxies show up later.
+    "Asia" to listOf("alibaba", "aliyun", "tencent", "baidu", "wechat", "weibo"),
+)
+
+private val CATEGORY_ORDER = listOf("RU", "EU", "US", "Asia", "Other")
+
+private fun classifyDomain(domain: String?): String {
+    if (domain.isNullOrEmpty()) return "Other"
+    for ((category, keywords) in DOMAIN_CATEGORIES) {
+        if (keywords.any { domain.contains(it) }) return category
+    }
+    return "Other"
+}
+
 // The server verifies from its own VPS/datacenter IP, which some MTProxy operators
 // block outright (a common anti-scanning measure) — confirmed by hand: proxies the
 // phone connects to fine sometimes fail the server's own from-VPS check. So its
@@ -94,6 +128,7 @@ data class Candidate(
     val secret: String,
     val mtprotoMs: Int,
     val isProtectedDomain: Boolean,
+    val category: String,
 )
 
 private fun decodeFakeTlsDomain(secret: String): String? {
@@ -124,7 +159,21 @@ private fun isProtectedDomain(domain: String?): Boolean {
 private fun Candidate.toTelegramProxyUrl(): String =
     "tg://proxy?server=$server&port=$port&secret=$secret"
 
-data class AliveHit(val candidate: Candidate, val pingMs: Long)
+// downloadKbps/uploadKbps come from TDLib's own getNetworkStatistics() sampled
+// right after the proxy connection reaches Ready - i.e. real bytes TDLib
+// actually sent/received through this proxy (protocol handshake + the initial
+// help.getConfig/init calls TDLib makes even before login). It is NOT a bulk
+// throughput test: no login happens in this scan, so no file is ever
+// transferred - the sample is just a few KB, so the number is dominated by
+// round-trip latency rather than sustained bandwidth. Still an honest,
+// real-bytes-over-this-real-connection measurement, just a small one - see
+// checkViaConnection(). Null if the stats call itself failed.
+data class AliveHit(
+    val candidate: Candidate,
+    val pingMs: Long,
+    val downloadKbps: Double?,
+    val uploadKbps: Double?,
+)
 
 private const val GITHUB_LATEST_RELEASE_URL =
     "https://api.github.com/repos/nikitasever/tgproxy-android-native/releases/latest"
@@ -258,20 +307,36 @@ fun ProxyCheckScreen(filesDirPath: String) {
 
         Divider(modifier = Modifier.padding(vertical = 12.dp))
 
+        val grouped: Map<String, List<AliveHit>> = aliveResults.groupBy { it.candidate.category }
+
         LazyColumn {
-            items(aliveResults) { hit ->
-                val tag = if (hit.candidate.isProtectedDomain) " [защищённый домен]" else ""
-                Text(
-                    text = "✓ ${hit.candidate.server}:${hit.candidate.port}$tag — ${hit.pingMs}мс — добавить в Telegram",
-                    textDecoration = TextDecoration.Underline,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(vertical = 8.dp)
-                        .clickable {
-                            val intent = Intent(Intent.ACTION_VIEW, Uri.parse(hit.candidate.toTelegramProxyUrl()))
-                            context.startActivity(intent)
-                        },
-                )
+            for (category in CATEGORY_ORDER) {
+                val hits = grouped[category] ?: continue
+                if (hits.isEmpty()) continue
+                item(key = "header-$category") {
+                    Text(
+                        text = "$category (${hits.size})",
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.fillMaxWidth().padding(top = 12.dp, bottom = 4.dp),
+                    )
+                }
+                items(hits) { hit ->
+                    val tag = if (hit.candidate.isProtectedDomain) " [защищённый домен]" else ""
+                    val speedText = if (hit.downloadKbps != null && hit.uploadKbps != null) {
+                        " — ↓%.1f/↑%.1f КБ/с (при подключении)".format(hit.downloadKbps, hit.uploadKbps)
+                    } else ""
+                    Text(
+                        text = "✓ ${hit.candidate.server}:${hit.candidate.port}$tag — ${hit.pingMs}мс$speedText — добавить в Telegram",
+                        textDecoration = TextDecoration.Underline,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(vertical = 8.dp)
+                            .clickable {
+                                val intent = Intent(Intent.ACTION_VIEW, Uri.parse(hit.candidate.toTelegramProxyUrl()))
+                                context.startActivity(intent)
+                            },
+                    )
+                }
             }
         }
     }
@@ -319,11 +384,18 @@ private suspend fun runMassScan(
             async {
                 semaphore.acquire()
                 try {
-                    val pingMs = checkViaConnection(filesDirPath, index, candidate)
+                    val result = checkViaConnection(filesDirPath, index, candidate)
                     checked++
-                    if (pingMs != null) {
+                    if (result != null) {
                         alive++
-                        onAlive(AliveHit(candidate, pingMs))
+                        onAlive(
+                            AliveHit(
+                                candidate = candidate,
+                                pingMs = result.pingMs,
+                                downloadKbps = result.downloadKbps,
+                                uploadKbps = result.uploadKbps,
+                            )
+                        )
                     }
                     onStatus("Проверено $checked/${subset.size}, живых сейчас: $alive")
                 } finally {
@@ -336,11 +408,13 @@ private suspend fun runMassScan(
     onStatus("Готово: $alive из ${subset.size} живы прямо сейчас (сервер верифицировал все ${subset.size} ранее)")
 }
 
+private data class ConnectResult(val pingMs: Long, val downloadKbps: Double?, val uploadKbps: Double?)
+
 private suspend fun checkViaConnection(
     filesDirPath: String,
     index: Int,
     candidate: Candidate,
-): Long? = withContext(Dispatchers.Default) {
+): ConnectResult? = withContext(Dispatchers.Default) {
     coroutineScope {
         val client = TdlClient.create()
         val ready = CompletableDeferred<Unit>()
@@ -373,7 +447,40 @@ private suspend fun checkViaConnection(
 
             val start = android.os.SystemClock.elapsedRealtime()
             val reached = withTimeoutOrNull(PER_PROXY_TIMEOUT_MS) { ready.await() } != null
-            if (reached) android.os.SystemClock.elapsedRealtime() - start else null
+            if (!reached) return@coroutineScope null
+            val pingMs = android.os.SystemClock.elapsedRealtime() - start
+
+            // Real bytes TDLib actually pushed through this proxy connection to get
+            // to Ready (protocol handshake + its initial pre-auth calls) - see the
+            // AliveHit doc comment for why this is honest but necessarily small.
+            val (downloadKbps, uploadKbps) = try {
+                when (val statsResult = client.getNetworkStatistics(onlyCurrent = true)) {
+                    is TdlResult.Success -> {
+                        var sent = 0L
+                        var received = 0L
+                        statsResult.result.entries.forEach { entry ->
+                            when (entry) {
+                                is dev.g000sha256.tdl.dto.NetworkStatisticsEntryCall -> {
+                                    sent += entry.sentBytes
+                                    received += entry.receivedBytes
+                                }
+                                is dev.g000sha256.tdl.dto.NetworkStatisticsEntryFile -> {
+                                    sent += entry.sentBytes
+                                    received += entry.receivedBytes
+                                }
+                                else -> Unit
+                            }
+                        }
+                        val seconds = (pingMs / 1000.0).coerceAtLeast(0.05)
+                        Pair(received / 1024.0 / seconds, sent / 1024.0 / seconds)
+                    }
+                    is TdlResult.Failure -> Pair(null, null)
+                }
+            } catch (e: Exception) {
+                Pair(null, null)
+            }
+
+            ConnectResult(pingMs = pingMs, downloadKbps = downloadKbps, uploadKbps = uploadKbps)
         } catch (e: Exception) {
             null
         } finally {
@@ -406,12 +513,14 @@ private suspend fun fetchJsonCandidates(url: String, jsonArrayKey: String): List
         (0 until itemsJson.length()).map { i ->
             val o = itemsJson.getJSONObject(i)
             val secret = o.getString("secret")
+            val domain = decodeFakeTlsDomain(secret)
             Candidate(
                 server = o.getString("server"),
                 port = o.getInt("port"),
                 secret = secret,
                 mtprotoMs = o.optInt("mtproto_ms", Int.MAX_VALUE),
-                isProtectedDomain = isProtectedDomain(decodeFakeTlsDomain(secret)),
+                isProtectedDomain = isProtectedDomain(domain),
+                category = classifyDomain(domain),
             )
         }
     }
