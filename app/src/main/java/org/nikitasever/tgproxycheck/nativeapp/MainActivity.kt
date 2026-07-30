@@ -175,21 +175,125 @@ data class AliveHit(
     val uploadKbps: Double?,
 )
 
+// Lower is "better" (sorted ascending), so it composes with plain ping ranking:
+// with no speed data it's just ping in ms. Measured speed and protected-domain
+// status pull the effective rank down (protected domains survive DPI far
+// better - see PROTECTED_DOMAIN_KEYWORDS above - so they're worth ranking
+// higher even at equal ping). Weights are deliberately rough; this is a rough
+// "which one would I actually pick" heuristic, not a precise scoring model.
+private fun AliveHit.recommendScore(): Double {
+    val speedBonus = (downloadKbps ?: 0.0) * 20.0 + (uploadKbps ?: 0.0) * 10.0
+    val protectedBonus = if (candidate.isProtectedDomain) 500.0 else 0.0
+    return pingMs.toDouble() - speedBonus - protectedBonus
+}
+
+private const val LAST_SCAN_FILE_NAME = "last_scan_results.json"
+
+data class LastScanSnapshot(val timestampMs: Long, val totalChecked: Int, val hits: List<AliveHit>)
+
+// Manual JSON (org.json, already used elsewhere in this file) rather than pulling
+// in a new serialization dependency for one small file.
+private fun saveLastScanResults(filesDirPath: String, totalChecked: Int, hits: List<AliveHit>) {
+    try {
+        val root = org.json.JSONObject()
+        root.put("timestampMs", System.currentTimeMillis())
+        root.put("totalChecked", totalChecked)
+        val resultsJson = JSONArray()
+        hits.forEach { hit ->
+            val o = org.json.JSONObject()
+            o.put("server", hit.candidate.server)
+            o.put("port", hit.candidate.port)
+            o.put("secret", hit.candidate.secret)
+            o.put("mtprotoMs", hit.candidate.mtprotoMs)
+            o.put("isProtectedDomain", hit.candidate.isProtectedDomain)
+            o.put("category", hit.candidate.category)
+            o.put("pingMs", hit.pingMs)
+            if (hit.downloadKbps != null) o.put("downloadKbps", hit.downloadKbps)
+            if (hit.uploadKbps != null) o.put("uploadKbps", hit.uploadKbps)
+            resultsJson.put(o)
+        }
+        root.put("results", resultsJson)
+        File(filesDirPath, LAST_SCAN_FILE_NAME).writeText(root.toString())
+    } catch (e: Exception) {
+        android.util.Log.e(UPDATE_CHECK_TAG, "saveLastScanResults failed: ${e.message}", e)
+    }
+}
+
+private fun loadLastScanResults(filesDirPath: String): LastScanSnapshot? {
+    return try {
+        val file = File(filesDirPath, LAST_SCAN_FILE_NAME)
+        if (!file.exists()) return null
+        val root = org.json.JSONObject(file.readText())
+        val resultsJson = root.getJSONArray("results")
+        val hits = (0 until resultsJson.length()).map { i ->
+            val o = resultsJson.getJSONObject(i)
+            AliveHit(
+                candidate = Candidate(
+                    server = o.getString("server"),
+                    port = o.getInt("port"),
+                    secret = o.getString("secret"),
+                    mtprotoMs = o.optInt("mtprotoMs", Int.MAX_VALUE),
+                    isProtectedDomain = o.getBoolean("isProtectedDomain"),
+                    category = o.getString("category"),
+                ),
+                pingMs = o.getLong("pingMs"),
+                downloadKbps = if (o.has("downloadKbps")) o.getDouble("downloadKbps") else null,
+                uploadKbps = if (o.has("uploadKbps")) o.getDouble("uploadKbps") else null,
+            )
+        }
+        LastScanSnapshot(
+            timestampMs = root.getLong("timestampMs"),
+            totalChecked = root.optInt("totalChecked", hits.size),
+            hits = hits,
+        )
+    } catch (e: Exception) {
+        android.util.Log.e(UPDATE_CHECK_TAG, "loadLastScanResults failed: ${e.message}", e)
+        null
+    }
+}
+
 private const val GITHUB_LATEST_RELEASE_URL =
     "https://api.github.com/repos/nikitasever/tgproxy-android-native/releases/latest"
 
 data class UpdateInfo(val version: String, val downloadUrl: String)
 
-private suspend fun checkForUpdate(): UpdateInfo? = withContext(Dispatchers.IO) {
+private const val UPDATE_CHECK_TAG = "TgProxyUpdateCheck"
+
+// Distinct outcomes instead of a bare nullable: "no update" and "check failed"
+// look identical to the user if collapsed into one null, which is exactly how
+// the previous private-repo-404 bug went unnoticed (unauthenticated GitHub API
+// calls to a private repo 404 - not 403 - and the old bare catch swallowed that
+// silently with no logging). Keeping these separate, and logging failures via
+// Log.e, means a regression like that is visible next time instead of silent.
+sealed class UpdateCheckResult {
+    data class Available(val info: UpdateInfo) : UpdateCheckResult()
+    object UpToDate : UpdateCheckResult()
+    data class Error(val message: String) : UpdateCheckResult()
+}
+
+private suspend fun checkForUpdate(): UpdateCheckResult = withContext(Dispatchers.IO) {
     try {
         val connection = java.net.URL(GITHUB_LATEST_RELEASE_URL).openConnection() as HttpsURLConnection
         connection.setRequestProperty("Accept", "application/vnd.github+json")
         connection.connectTimeout = 10_000
         connection.readTimeout = 10_000
+
+        val responseCode = connection.responseCode
+        if (responseCode !in 200..299) {
+            val errorBody = try {
+                connection.errorStream?.bufferedReader()?.use { it.readText() }
+            } catch (e: Exception) {
+                null
+            }
+            val message = "HTTP $responseCode${errorBody?.let { " — $it" } ?: ""}"
+            android.util.Log.e(UPDATE_CHECK_TAG, "checkForUpdate failed: $message")
+            return@withContext UpdateCheckResult.Error(message)
+        }
+
         val body = connection.inputStream.bufferedReader().use { it.readText() }
         val root = org.json.JSONObject(body)
         val tagName = root.getString("tag_name").removePrefix("v")
-        if (tagName == BuildConfig.VERSION_NAME) return@withContext null
+        if (tagName == BuildConfig.VERSION_NAME) return@withContext UpdateCheckResult.UpToDate
 
         val assets = root.getJSONArray("assets")
         var downloadUrl: String? = null
@@ -200,9 +304,16 @@ private suspend fun checkForUpdate(): UpdateInfo? = withContext(Dispatchers.IO) 
                 break
             }
         }
-        downloadUrl?.let { UpdateInfo(version = tagName, downloadUrl = it) }
+        if (downloadUrl == null) {
+            val message = "release $tagName has no app-debug.apk asset"
+            android.util.Log.e(UPDATE_CHECK_TAG, "checkForUpdate failed: $message")
+            return@withContext UpdateCheckResult.Error(message)
+        }
+        UpdateCheckResult.Available(UpdateInfo(version = tagName, downloadUrl = downloadUrl))
     } catch (e: Exception) {
-        null
+        val message = "${e::class.simpleName}: ${e.message}"
+        android.util.Log.e(UPDATE_CHECK_TAG, "checkForUpdate failed: $message", e)
+        UpdateCheckResult.Error(message)
     }
 }
 
@@ -229,6 +340,11 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+private fun formatLastScanTimestamp(timestampMs: Long): String {
+    val fmt = java.text.SimpleDateFormat("H:mm, d.M.yy", java.util.Locale.getDefault())
+    return fmt.format(java.util.Date(timestampMs))
+}
+
 @Composable
 fun ProxyCheckScreen(filesDirPath: String) {
     var status by remember { mutableStateOf("Готово") }
@@ -238,12 +354,34 @@ fun ProxyCheckScreen(filesDirPath: String) {
 
     var updateInfo by remember { mutableStateOf<UpdateInfo?>(null) }
     var updateStatus by remember { mutableStateOf<String?>(null) }
+    var updateCheckError by remember { mutableStateOf<String?>(null) }
+
+    var lastScanInfo by remember { mutableStateOf<String?>(null) }
+    var totalCheckedLast by remember { mutableStateOf(0) }
 
     LaunchedEffect(Unit) {
-        updateInfo = checkForUpdate()
+        when (val result = checkForUpdate()) {
+            is UpdateCheckResult.Available -> updateInfo = result.info
+            UpdateCheckResult.UpToDate -> Unit
+            is UpdateCheckResult.Error -> updateCheckError = result.message
+        }
+
+        // Load the previous scan's results immediately on cold start, before any
+        // new scan runs, so the user isn't staring at an empty screen while a
+        // fresh scan (which can take a while over hundreds of candidates) runs.
+        val snapshot = loadLastScanResults(filesDirPath)
+        if (snapshot != null) {
+            aliveResults.addAll(snapshot.hits)
+            totalCheckedLast = snapshot.totalChecked
+            lastScanInfo = "Последнее сканирование: ${snapshot.hits.size} из ${snapshot.totalChecked} " +
+                "живы (${formatLastScanTimestamp(snapshot.timestampMs)})"
+        }
     }
 
     Column(modifier = Modifier.fillMaxSize().padding(24.dp)) {
+        if (updateInfo == null && updateCheckError != null) {
+            Text(text = "Не удалось проверить обновление: $updateCheckError")
+        }
         updateInfo?.let { info ->
             Text(text = "Доступно обновление: v${info.version}${updateStatus?.let { " — $it" } ?: ""}")
             Button(
@@ -292,13 +430,26 @@ fun ProxyCheckScreen(filesDirPath: String) {
 
         Text(text = status)
 
+        lastScanInfo?.let { info ->
+            Text(text = info, modifier = Modifier.padding(top = 4.dp))
+        }
+
         Button(
             modifier = Modifier.fillMaxWidth().padding(top = 12.dp),
             onClick = {
                 aliveResults.clear()
+                lastScanInfo = null
                 status = "Загружаю список кандидатов..."
                 scope.launch {
-                    runMassScan(filesDirPath, onStatus = { status = it }, onAlive = { aliveResults.add(it) })
+                    runMassScan(
+                        filesDirPath,
+                        onStatus = { status = it },
+                        onAlive = { aliveResults.add(it) },
+                        onComplete = { totalChecked ->
+                            totalCheckedLast = totalChecked
+                            saveLastScanResults(filesDirPath, totalChecked, aliveResults.toList())
+                        },
+                    )
                 }
             },
         ) {
@@ -307,9 +458,49 @@ fun ProxyCheckScreen(filesDirPath: String) {
 
         Divider(modifier = Modifier.padding(vertical = 12.dp))
 
-        val grouped: Map<String, List<AliveHit>> = aliveResults.groupBy { it.candidate.category }
+        // Sort by a combined "how good is this proxy right now" score everywhere:
+        // ascending ping as the base signal, pulled down further by measured
+        // speed and by protected-domain status (see recommendScore() doc above).
+        val recommended = aliveResults.sortedBy { it.recommendScore() }.take(8)
+        val grouped: Map<String, List<AliveHit>> = aliveResults
+            .groupBy { it.candidate.category }
+            .mapValues { (_, hits) -> hits.sortedBy { it.recommendScore() } }
+
+        fun hitLine(hit: AliveHit): String {
+            val tag = if (hit.candidate.isProtectedDomain) " [защищённый домен]" else ""
+            val speedText = if (hit.downloadKbps != null && hit.uploadKbps != null) {
+                " — ↓%.1f/↑%.1f КБ/с (при подключении)".format(hit.downloadKbps, hit.uploadKbps)
+            } else ""
+            return "✓ ${hit.candidate.server}:${hit.candidate.port}$tag — ${hit.pingMs}мс$speedText — добавить в Telegram"
+        }
 
         LazyColumn {
+            if (recommended.isNotEmpty()) {
+                item(key = "header-recommended") {
+                    Text(
+                        text = "⭐ Рекомендуем (${recommended.size})",
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.fillMaxWidth().padding(top = 4.dp, bottom = 4.dp),
+                    )
+                }
+                items(recommended, key = { "rec-${it.candidate.server}:${it.candidate.port}" }) { hit ->
+                    Text(
+                        text = hitLine(hit),
+                        textDecoration = TextDecoration.Underline,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(vertical = 8.dp)
+                            .clickable {
+                                val intent = Intent(Intent.ACTION_VIEW, Uri.parse(hit.candidate.toTelegramProxyUrl()))
+                                context.startActivity(intent)
+                            },
+                    )
+                }
+                item(key = "recommended-divider") {
+                    Divider(modifier = Modifier.padding(vertical = 12.dp))
+                }
+            }
+
             for (category in CATEGORY_ORDER) {
                 val hits = grouped[category] ?: continue
                 if (hits.isEmpty()) continue
@@ -320,13 +511,9 @@ fun ProxyCheckScreen(filesDirPath: String) {
                         modifier = Modifier.fillMaxWidth().padding(top = 12.dp, bottom = 4.dp),
                     )
                 }
-                items(hits) { hit ->
-                    val tag = if (hit.candidate.isProtectedDomain) " [защищённый домен]" else ""
-                    val speedText = if (hit.downloadKbps != null && hit.uploadKbps != null) {
-                        " — ↓%.1f/↑%.1f КБ/с (при подключении)".format(hit.downloadKbps, hit.uploadKbps)
-                    } else ""
+                items(hits, key = { "cat-$category-${it.candidate.server}:${it.candidate.port}" }) { hit ->
                     Text(
-                        text = "✓ ${hit.candidate.server}:${hit.candidate.port}$tag — ${hit.pingMs}мс$speedText — добавить в Telegram",
+                        text = hitLine(hit),
                         textDecoration = TextDecoration.Underline,
                         modifier = Modifier
                             .fillMaxWidth()
@@ -346,6 +533,7 @@ private suspend fun runMassScan(
     filesDirPath: String,
     onStatus: (String) -> Unit,
     onAlive: (AliveHit) -> Unit,
+    onComplete: (totalChecked: Int) -> Unit = {},
 ) {
     val verified: List<Candidate>
     val raw: List<Candidate>
@@ -406,6 +594,7 @@ private suspend fun runMassScan(
     }
 
     onStatus("Готово: $alive из ${subset.size} живы прямо сейчас (сервер верифицировал все ${subset.size} ранее)")
+    onComplete(subset.size)
 }
 
 private data class ConnectResult(val pingMs: Long, val downloadKbps: Double?, val uploadKbps: Double?)
