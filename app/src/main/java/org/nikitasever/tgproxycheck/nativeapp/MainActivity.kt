@@ -33,6 +33,7 @@ import androidx.core.content.FileProvider
 import java.io.File
 import dev.g000sha256.tdl.TdlClient
 import dev.g000sha256.tdl.TdlResult
+import dev.g000sha256.tdl.dto.AuthorizationStateClosed
 import dev.g000sha256.tdl.dto.ConnectionStateReady
 import dev.g000sha256.tdl.dto.Proxy
 import dev.g000sha256.tdl.dto.ProxyType
@@ -119,14 +120,20 @@ private fun classifyDomain(domain: String?): String {
 // trusted as the pool to draw from; the raw, unfiltered candidates.json pool (tested
 // live from this phone) is the only reliable ground truth.
 private const val REGULAR_FILL_LIMIT = 350
-// Was 16. Each candidate spins up a fully separate native TDLib client (own DB,
-// own threads); at 16-way concurrency across a 448-candidate run the native/JVM
-// heap pressure is very plausibly what killed the process around candidate ~49
-// in the field (see SCAN_TAG logging + the Throwable-catching added around
-// checkViaConnection below). Lowering concurrency is a cheap way to reduce peak
-// resource usage in addition to the crash-hardening.
-private const val SCAN_CONCURRENCY = 10
+// Was 16, then 10 in 0.7.1 - that only delayed the crash (49 -> 82), it didn't
+// fix it, because the real bug wasn't concurrency, it was that closed native
+// TDLib clients were never confirmed closed before being torn down (see the
+// close()/AuthorizationStateClosed doc comment on checkViaConnection). Now that
+// every client's native shutdown is properly awaited before its files are
+// deleted and the next candidate starts, 6-way concurrency is a conservative
+// safety margin against whatever headroom is left, not the primary fix.
+private const val SCAN_CONCURRENCY = 6
 private const val PER_PROXY_TIMEOUT_MS = 6_000L
+// How long to wait for TDLib to confirm a client's native shutdown
+// (AuthorizationStateClosed) after close() is requested, before giving up and
+// deleting its db directory anyway. close() itself only enqueues the shutdown -
+// see the doc comment on checkViaConnection.
+private const val CLOSE_TIMEOUT_MS = 5_000L
 private const val SCAN_TAG = "TgProxyScan"
 
 data class Candidate(
@@ -664,28 +671,48 @@ private suspend fun runMassScan(
 private data class ConnectResult(val pingMs: Long, val downloadKbps: Double?, val uploadKbps: Double?)
 
 // Each call creates its own isolated native TDLib client + on-disk DB directory.
-// Root-caused crash (v0.7.0-native-poc): a couple of things compounded under a
-// 448-candidate / 16-way-concurrent scan:
-//  1. TdlClient.create() (and the TDLib calls after it) can fail with an
-//     OutOfMemoryError under memory pressure from many concurrent native
-//     clients - OutOfMemoryError is an Error, not an Exception, so the old
-//     `catch (e: Exception)` here did NOT catch it. An uncaught Error/Exception
-//     from inside `async { }` propagates up through the parent `coroutineScope`
-//     in runMassScan and kills the entire scan (and, since nothing upstream
-//     installs a CoroutineExceptionHandler, the whole app) - matching the
-//     observed "died partway through, at candidate ~49/448" symptom exactly.
-//  2. tdlib-scan-$index / tdlib-scan-$index-files directories were never
-//     deleted, so every run left behind TDLib's sqlite db/wal/journal files;
-//     a run that died mid-scan (crash, or the user force-closing it) could
-//     leave a stale lock on one of those directories, which would plausibly
-//     make the *next* attempt to open the same directory hang or fail - and
-//     "clear the app cache first" (which wipes filesDir) is exactly the fix
-//     that would clear such a stale lock, matching what the user had to do.
-// Fix: catch Throwable (not just Exception) around the whole client lifecycle,
-// log every failure so a real crash is diagnosable from logcat next time
-// instead of silently swallowed, and delete each candidate's scan directories
-// immediately after that candidate's check finishes so nothing accumulates or
-// goes stale across a run.
+//
+// v0.7.1-native-poc root-caused a crash at candidate ~49/448 (16-way
+// concurrency) to OutOfMemoryError not being caught by `catch (e: Exception)`,
+// plus stale leftover db directories, and shipped: catching Throwable, deleting
+// each candidate's scan directories in a finally block, and lowering
+// concurrency 16->10. That crash STILL happened in the field afterwards, just
+// later (candidate ~82/450 instead of ~49) - proof the real bug wasn't fixed,
+// only its symptom was delayed by the lower concurrency.
+//
+// Real root cause (confirmed by reading the dev.g000sha256:tdl-coroutines-android
+// 14.0.0 source, both TdlClient.kt's doc comment on close() and
+// TdlServiceLocator.kt/TdlRepository.kt's implementation):
+//   `client.close()` is a *TDLib API call*, not a resource-disposal method - it
+//   is generated exactly like `closeChat`/`closeStory`/etc. Its doc comment says
+//   plainly: "Closes the TDLib instance. All databases will be flushed to disk
+//   and properly closed. After the close completes, updateAuthorizationState
+//   with authorizationStateClosed will be sent." The suspend function returning
+//   TdlResult<Ok> only means TDLib *received* the close request - not that the
+//   native shutdown (flushing/closing the sqlite db, releasing the client's
+//   native Td actor) has actually finished. That confirmation only arrives
+//   later, asynchronously, as an AuthorizationStateClosed update.
+//   The old code called `client?.close()` and, without waiting for that update,
+//   immediately ran `dbDir.deleteRecursively()` and moved on to the next
+//   candidate. So across a run: (a) directory deletion could race a still-open
+//   native sqlite file handle, and (b) - more importantly - the native Td actor
+//   for that clientId was never confirmed torn down before we abandoned it and
+//   created a new one for the next candidate. dev.g000sha256's own
+//   TdlServiceLocator.kt shows the receiver thread, sender thread and the
+//   native ClientManager are process-wide singletons shared by every
+//   TdlClient.create() call - so this isn't "16/10 native processes", it's one
+//   shared native manager accumulating an ever-growing number of live,
+//   never-fully-closed Td actors (each still holding its own db handle,
+//   sockets, timers) as the scan progresses. That's a textbook native
+//   resource leak: it wouldn't crash at candidate 5, but it very plausibly
+//   crashes once enough candidates have piled up - exactly matching "same
+//   crash, just later" between 0.7.0 (16-way, ~49) and 0.7.1 (10-way, ~82).
+// Fix: after requesting close(), actually wait (with a bounded timeout, in
+// case a given proxy/candidate leaves TDLib wedged) for AuthorizationStateClosed
+// before touching that candidate's db directory or letting the semaphore admit
+// the next candidate. This makes native teardown a real precondition of moving
+// on, not a fire-and-forget. Concurrency is also dropped further (10->6) as a
+// safety margin on top of this, not as the fix itself.
 private suspend fun checkViaConnection(
     filesDirPath: String,
     index: Int,
@@ -696,12 +723,20 @@ private suspend fun checkViaConnection(
         val filesDirForClient = File(filesDirPath, "tdlib-scan-$index-files")
         var client: TdlClient? = null
         var collectorJob: kotlinx.coroutines.Job? = null
+        var authCollectorJob: kotlinx.coroutines.Job? = null
+        val closed = CompletableDeferred<Unit>()
         try {
             client = TdlClient.create()
             val localClient = client
             val ready = CompletableDeferred<Unit>()
             collectorJob = localClient.connectionStateUpdates
                 .onEach { update -> if (update.state is ConnectionStateReady) ready.complete(Unit) }
+                .launchIn(this)
+            // Watched from the start (not just after close() is called) so a
+            // client that somehow reaches Closed on its own (e.g. TDLib-side
+            // error path) is still observed correctly.
+            authCollectorJob = localClient.authorizationStateUpdates
+                .onEach { update -> if (update.authorizationState is AuthorizationStateClosed) closed.complete(Unit) }
                 .launchIn(this)
 
             val paramsResult = localClient.setTdlibParameters(
@@ -750,10 +785,33 @@ private suspend fun checkViaConnection(
             } catch (e: Throwable) {
                 android.util.Log.e(SCAN_TAG, "collectorJob.cancel #$index failed: ${e.message}", e)
             }
+            // The actual fix: close() only *requests* shutdown (see the doc
+            // comment above checkViaConnection) - wait for TDLib to confirm the
+            // native client actually finished tearing down before deleting its
+            // db files or letting the semaphore admit the next candidate. If
+            // that confirmation never arrives within CLOSE_TIMEOUT_MS (e.g. a
+            // wedged proxy connection), log it clearly - that candidate's
+            // native client may be leaking - and fall through to cleanup rather
+            // than hang the whole scan on one bad candidate.
+            if (client != null) {
+                try {
+                    client.close()
+                    val confirmedClosed = withTimeoutOrNull(CLOSE_TIMEOUT_MS) { closed.await() } != null
+                    if (!confirmedClosed) {
+                        android.util.Log.e(
+                            SCAN_TAG,
+                            "client.close #$index (${candidate.server}:${candidate.port}) did not confirm " +
+                                "AuthorizationStateClosed within ${CLOSE_TIMEOUT_MS}ms - possible native leak",
+                        )
+                    }
+                } catch (e: Throwable) {
+                    android.util.Log.e(SCAN_TAG, "client.close #$index failed: ${e.message}", e)
+                }
+            }
             try {
-                client?.close()
+                authCollectorJob?.cancel()
             } catch (e: Throwable) {
-                android.util.Log.e(SCAN_TAG, "client.close #$index failed: ${e.message}", e)
+                android.util.Log.e(SCAN_TAG, "authCollectorJob.cancel #$index failed: ${e.message}", e)
             }
             try {
                 dbDir.deleteRecursively()
