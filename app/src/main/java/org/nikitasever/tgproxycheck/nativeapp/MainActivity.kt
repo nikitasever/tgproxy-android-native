@@ -1,8 +1,11 @@
 package org.nikitasever.tgproxycheck.nativeapp
 
+import android.content.Intent
+import android.net.Uri
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -21,6 +24,8 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.unit.dp
 import dev.g000sha256.tdl.TdlClient
 import dev.g000sha256.tdl.TdlResult
@@ -111,6 +116,9 @@ private fun isProtectedDomain(domain: String?): Boolean {
     return PROTECTED_DOMAIN_KEYWORDS.any { domain.contains(it) }
 }
 
+private fun Candidate.toTelegramProxyUrl(): String =
+    "https://t.me/proxy?server=$server&port=$port&secret=$secret"
+
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -128,7 +136,8 @@ class MainActivity : ComponentActivity() {
 fun ProxyCheckScreen(filesDirPath: String) {
     var status by remember { mutableStateOf("Готово") }
     val scope = remember { CoroutineScope(Dispatchers.Main) }
-    val aliveResults = remember { mutableStateListOf<String>() }
+    val aliveResults = remember { mutableStateListOf<Candidate>() }
+    val context = LocalContext.current
 
     Column(modifier = Modifier.fillMaxSize().padding(24.dp)) {
         Text(text = status)
@@ -149,8 +158,19 @@ fun ProxyCheckScreen(filesDirPath: String) {
         Divider(modifier = Modifier.padding(vertical = 12.dp))
 
         LazyColumn {
-            items(aliveResults) { line ->
-                Text(text = line, modifier = Modifier.padding(vertical = 4.dp))
+            items(aliveResults) { candidate ->
+                val tag = if (candidate.isProtectedDomain) " [защищённый домен]" else ""
+                Text(
+                    text = "✓ ${candidate.server}:${candidate.port}$tag — добавить в Telegram",
+                    textDecoration = TextDecoration.Underline,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 8.dp)
+                        .clickable {
+                            val intent = Intent(Intent.ACTION_VIEW, Uri.parse(candidate.toTelegramProxyUrl()))
+                            context.startActivity(intent)
+                        },
+                )
             }
         }
     }
@@ -159,7 +179,7 @@ fun ProxyCheckScreen(filesDirPath: String) {
 private suspend fun runMassScan(
     filesDirPath: String,
     onStatus: (String) -> Unit,
-    onAlive: (String) -> Unit,
+    onAlive: (Candidate) -> Unit,
 ) {
     val verified: List<Candidate>
     val raw: List<Candidate>
@@ -202,8 +222,7 @@ private suspend fun runMassScan(
                     checked++
                     if (ok) {
                         alive++
-                        val tag = if (candidate.isProtectedDomain) " [защищённый домен]" else ""
-                        onAlive("✓ ${candidate.server}:${candidate.port}$tag")
+                        onAlive(candidate)
                     }
                     onStatus("Проверено $checked/${subset.size}, живых сейчас: $alive")
                 } finally {
