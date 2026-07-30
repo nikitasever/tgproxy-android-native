@@ -116,8 +116,12 @@ private fun isProtectedDomain(domain: String?): Boolean {
     return PROTECTED_DOMAIN_KEYWORDS.any { domain.contains(it) }
 }
 
+// tg:// is Telegram's own scheme, handled only by the Telegram app itself - unlike
+// https://t.me/..., which Android may route to a browser instead of the app.
 private fun Candidate.toTelegramProxyUrl(): String =
-    "https://t.me/proxy?server=$server&port=$port&secret=$secret"
+    "tg://proxy?server=$server&port=$port&secret=$secret"
+
+data class AliveHit(val candidate: Candidate, val pingMs: Long)
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -136,7 +140,7 @@ class MainActivity : ComponentActivity() {
 fun ProxyCheckScreen(filesDirPath: String) {
     var status by remember { mutableStateOf("Готово") }
     val scope = remember { CoroutineScope(Dispatchers.Main) }
-    val aliveResults = remember { mutableStateListOf<Candidate>() }
+    val aliveResults = remember { mutableStateListOf<AliveHit>() }
     val context = LocalContext.current
 
     Column(modifier = Modifier.fillMaxSize().padding(24.dp)) {
@@ -158,16 +162,16 @@ fun ProxyCheckScreen(filesDirPath: String) {
         Divider(modifier = Modifier.padding(vertical = 12.dp))
 
         LazyColumn {
-            items(aliveResults) { candidate ->
-                val tag = if (candidate.isProtectedDomain) " [защищённый домен]" else ""
+            items(aliveResults) { hit ->
+                val tag = if (hit.candidate.isProtectedDomain) " [защищённый домен]" else ""
                 Text(
-                    text = "✓ ${candidate.server}:${candidate.port}$tag — добавить в Telegram",
+                    text = "✓ ${hit.candidate.server}:${hit.candidate.port}$tag — ${hit.pingMs}мс — добавить в Telegram",
                     textDecoration = TextDecoration.Underline,
                     modifier = Modifier
                         .fillMaxWidth()
                         .padding(vertical = 8.dp)
                         .clickable {
-                            val intent = Intent(Intent.ACTION_VIEW, Uri.parse(candidate.toTelegramProxyUrl()))
+                            val intent = Intent(Intent.ACTION_VIEW, Uri.parse(hit.candidate.toTelegramProxyUrl()))
                             context.startActivity(intent)
                         },
                 )
@@ -179,7 +183,7 @@ fun ProxyCheckScreen(filesDirPath: String) {
 private suspend fun runMassScan(
     filesDirPath: String,
     onStatus: (String) -> Unit,
-    onAlive: (Candidate) -> Unit,
+    onAlive: (AliveHit) -> Unit,
 ) {
     val verified: List<Candidate>
     val raw: List<Candidate>
@@ -218,11 +222,11 @@ private suspend fun runMassScan(
             async {
                 semaphore.acquire()
                 try {
-                    val ok = checkViaConnection(filesDirPath, index, candidate)
+                    val pingMs = checkViaConnection(filesDirPath, index, candidate)
                     checked++
-                    if (ok) {
+                    if (pingMs != null) {
                         alive++
-                        onAlive(candidate)
+                        onAlive(AliveHit(candidate, pingMs))
                     }
                     onStatus("Проверено $checked/${subset.size}, живых сейчас: $alive")
                 } finally {
@@ -239,7 +243,7 @@ private suspend fun checkViaConnection(
     filesDirPath: String,
     index: Int,
     candidate: Candidate,
-): Boolean = withContext(Dispatchers.Default) {
+): Long? = withContext(Dispatchers.Default) {
     coroutineScope {
         val client = TdlClient.create()
         val ready = CompletableDeferred<Unit>()
@@ -263,16 +267,18 @@ private suspend fun checkViaConnection(
                 systemVersion = "unknown",
                 applicationVersion = "0.1",
             )
-            if (paramsResult is TdlResult.Failure) return@coroutineScope false
+            if (paramsResult is TdlResult.Failure) return@coroutineScope null
 
             val proxyType: ProxyType = ProxyTypeMtproto(secret = candidate.secret)
             val proxy = Proxy(server = candidate.server, port = candidate.port, type = proxyType)
             val addResult = client.addProxy(proxy = proxy, enable = true, comment = "mass-scan")
-            if (addResult is TdlResult.Failure) return@coroutineScope false
+            if (addResult is TdlResult.Failure) return@coroutineScope null
 
-            withTimeoutOrNull(PER_PROXY_TIMEOUT_MS) { ready.await() } != null
+            val start = android.os.SystemClock.elapsedRealtime()
+            val reached = withTimeoutOrNull(PER_PROXY_TIMEOUT_MS) { ready.await() } != null
+            if (reached) android.os.SystemClock.elapsedRealtime() - start else null
         } catch (e: Exception) {
-            false
+            null
         } finally {
             collectorJob.cancel()
             client.close()
