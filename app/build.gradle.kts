@@ -37,8 +37,8 @@ android {
         // silently keep the already-installed APK instead of updating (confirmed:
         // v0.1.2 through v0.3.0 all shipped with this stuck at 2, so several
         // "updated" installs were actually still running old code).
-        versionCode = 16
-        versionName = "0.7.2-native-poc"
+        versionCode = 17
+        versionName = "0.8.0-native-poc"
         buildConfigField("int", "TG_API_ID", localProps.getProperty("tg.api_id", "0"))
         buildConfigField("String", "TG_API_HASH", "\"${localProps.getProperty("tg.api_hash", "")}\"")
     }

@@ -34,6 +34,7 @@ import java.io.File
 import dev.g000sha256.tdl.TdlClient
 import dev.g000sha256.tdl.TdlResult
 import dev.g000sha256.tdl.dto.AuthorizationStateClosed
+import dev.g000sha256.tdl.dto.ConnectionState
 import dev.g000sha256.tdl.dto.ConnectionStateReady
 import dev.g000sha256.tdl.dto.Proxy
 import dev.g000sha256.tdl.dto.ProxyType
@@ -43,11 +44,11 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.launchIn
 import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONArray
@@ -120,19 +121,26 @@ private fun classifyDomain(domain: String?): String {
 // trusted as the pool to draw from; the raw, unfiltered candidates.json pool (tested
 // live from this phone) is the only reliable ground truth.
 private const val REGULAR_FILL_LIMIT = 350
-// Was 16, then 10 in 0.7.1 - that only delayed the crash (49 -> 82), it didn't
-// fix it, because the real bug wasn't concurrency, it was that closed native
-// TDLib clients were never confirmed closed before being torn down (see the
-// close()/AuthorizationStateClosed doc comment on checkViaConnection). Now that
-// every client's native shutdown is properly awaited before its files are
-// deleted and the next candidate starts, 6-way concurrency is a conservative
-// safety margin against whatever headroom is left, not the primary fix.
+// History: 16 (0.7.0) -> crashed ~49/448. 10 (0.7.1, "catch Throwable + delete
+// per-candidate dirs") -> crashed ~82/450, just later, not fixed. 6 (0.7.2,
+// "wait for AuthorizationStateClosed before tearing down") -> crashed ~96/450,
+// again just later. All three treated symptoms of the same root cause: a
+// brand-new native TDLib client was being created AND destroyed for every
+// single one of ~450 candidates, and dev.g000sha256:tdl-coroutines-android's
+// own TdlServiceLocator/TdlEngine show the receiver thread, sender thread and
+// native ClientManager are process-wide singletons - so every teardown (even a
+// "clean" one) adds to a monotonically growing amount of native bookkeeping
+// that nothing before 0.8.0 ever gave back. 0.8.0 removes the per-candidate
+// create/destroy cycle entirely (see runPoolWorker below): a fixed pool of
+// SCAN_CONCURRENCY clients is created ONCE and reused for the whole scan, so
+// this number is now genuinely just "how many proxies are dialed at once",
+// not a mitigation for a leak.
 private const val SCAN_CONCURRENCY = 6
 private const val PER_PROXY_TIMEOUT_MS = 6_000L
 // How long to wait for TDLib to confirm a client's native shutdown
 // (AuthorizationStateClosed) after close() is requested, before giving up and
 // deleting its db directory anyway. close() itself only enqueues the shutdown -
-// see the doc comment on checkViaConnection.
+// see the doc comment on runPoolWorker.
 private const val CLOSE_TIMEOUT_MS = 5_000L
 private const val SCAN_TAG = "TgProxyScan"
 
@@ -610,55 +618,66 @@ private suspend fun runMassScan(
             "защищённых доменов: ${protected.size}, проверяю ${subset.size}..."
     )
 
-    // Plain Int++ from multiple concurrent coroutines (SCAN_CONCURRENCY-way, on
-    // Dispatchers.Default so genuinely multi-threaded) is a data race; use atomics
-    // so the "Проверено N/M" counter is actually accurate.
+    if (subset.isEmpty()) {
+        onStatus("Готово: нет кандидатов для проверки")
+        onComplete(0)
+        return
+    }
+
+    // Plain Int++ from multiple concurrent pool workers (on Dispatchers.Default,
+    // so genuinely multi-threaded) is a data race; use atomics so the
+    // "Проверено N/M" counter is actually accurate.
     val checked = java.util.concurrent.atomic.AtomicInteger(0)
     val alive = java.util.concurrent.atomic.AtomicInteger(0)
-    val semaphore = Semaphore(SCAN_CONCURRENCY)
+
+    // Distribute candidates round-robin across the SCAN_CONCURRENCY pool workers
+    // (rather than in contiguous blocks) so every worker gets a mix of
+    // protected-domain/high-priority and filler candidates, instead of worker 0
+    // racing through only the "best" ones while the last worker gets the dregs.
+    val chunks = Array(SCAN_CONCURRENCY) { mutableListOf<IndexedValue<Candidate>>() }
+    subset.forEachIndexed { index, candidate ->
+        chunks[index % SCAN_CONCURRENCY].add(IndexedValue(index, candidate))
+    }
+
+    // Pool worker db/files dirs are stable and reused across every candidate a
+    // worker processes *within this run* (see runPoolWorker) - but they're
+    // wiped clean here, once, at the START of the run, so a stale proxy-list
+    // entry or auth-state leftover from a previous scan can never bleed into
+    // this one. They must NOT be touched again until the whole run finishes.
+    for (workerIndex in 0 until SCAN_CONCURRENCY) {
+        File(filesDirPath, "tdlib-pool-$workerIndex").deleteRecursively()
+        File(filesDirPath, "tdlib-pool-$workerIndex-files").deleteRecursively()
+    }
 
     // A single candidate throwing used to be able to take the whole scan (and the
     // app) down with it: `async { }` inside `coroutineScope { }` propagates any
     // uncaught exception from a child up through the whole scope, cancelling every
-    // other in-flight candidate and rethrowing out of runMassScan - and since the
+    // other in-flight worker and rethrowing out of runMassScan - and since the
     // caller (scope.launch in ProxyCheckScreen) has no CoroutineExceptionHandler,
-    // that crashes the whole app. checkViaConnection now catches Throwable
-    // internally, but this outer catch is a second line of defence in case
-    // something throws before/after that (e.g. AtomicInteger ops, onAlive/onStatus
-    // callbacks) so one bad candidate never kills the other 447.
+    // that crashes the whole app. runPoolWorker/checkOneCandidate catch Throwable
+    // internally per-candidate, but this outer catch is a second line of defence
+    // in case something throws outside that (e.g. client creation itself) so one
+    // bad worker never kills the others.
     coroutineScope {
-        subset.mapIndexed { index, candidate ->
+        (0 until SCAN_CONCURRENCY).map { workerIndex ->
             async {
-                semaphore.acquire()
                 try {
-                    val result = try {
-                        checkViaConnection(filesDirPath, index, candidate)
-                    } catch (e: Throwable) {
-                        android.util.Log.e(
-                            SCAN_TAG,
-                            "candidate #$index (${candidate.server}:${candidate.port}) crashed the check: " +
-                                "${e::class.simpleName}: ${e.message}",
-                            e,
-                        )
-                        null
-                    }
-                    val checkedNow = checked.incrementAndGet()
-                    if (result != null) {
-                        val aliveNow = alive.incrementAndGet()
-                        onAlive(
-                            AliveHit(
-                                candidate = candidate,
-                                pingMs = result.pingMs,
-                                downloadKbps = result.downloadKbps,
-                                uploadKbps = result.uploadKbps,
-                            )
-                        )
-                        onStatus("Проверено $checkedNow/${subset.size}, живых сейчас: $aliveNow")
-                    } else {
-                        onStatus("Проверено $checkedNow/${subset.size}, живых сейчас: ${alive.get()}")
-                    }
-                } finally {
-                    semaphore.release()
+                    runPoolWorker(
+                        filesDirPath = filesDirPath,
+                        workerIndex = workerIndex,
+                        assigned = chunks[workerIndex],
+                        totalSubset = subset.size,
+                        checked = checked,
+                        alive = alive,
+                        onStatus = onStatus,
+                        onAlive = onAlive,
+                    )
+                } catch (e: Throwable) {
+                    android.util.Log.e(
+                        SCAN_TAG,
+                        "pool worker #$workerIndex crashed: ${e::class.simpleName}: ${e.message}",
+                        e,
+                    )
                 }
             }
         }.awaitAll()
@@ -670,76 +689,92 @@ private suspend fun runMassScan(
 
 private data class ConnectResult(val pingMs: Long, val downloadKbps: Double?, val uploadKbps: Double?)
 
-// Each call creates its own isolated native TDLib client + on-disk DB directory.
-//
-// v0.7.1-native-poc root-caused a crash at candidate ~49/448 (16-way
-// concurrency) to OutOfMemoryError not being caught by `catch (e: Exception)`,
-// plus stale leftover db directories, and shipped: catching Throwable, deleting
-// each candidate's scan directories in a finally block, and lowering
-// concurrency 16->10. That crash STILL happened in the field afterwards, just
-// later (candidate ~82/450 instead of ~49) - proof the real bug wasn't fixed,
-// only its symptom was delayed by the lower concurrency.
-//
-// Real root cause (confirmed by reading the dev.g000sha256:tdl-coroutines-android
-// 14.0.0 source, both TdlClient.kt's doc comment on close() and
-// TdlServiceLocator.kt/TdlRepository.kt's implementation):
-//   `client.close()` is a *TDLib API call*, not a resource-disposal method - it
-//   is generated exactly like `closeChat`/`closeStory`/etc. Its doc comment says
-//   plainly: "Closes the TDLib instance. All databases will be flushed to disk
-//   and properly closed. After the close completes, updateAuthorizationState
-//   with authorizationStateClosed will be sent." The suspend function returning
-//   TdlResult<Ok> only means TDLib *received* the close request - not that the
-//   native shutdown (flushing/closing the sqlite db, releasing the client's
-//   native Td actor) has actually finished. That confirmation only arrives
-//   later, asynchronously, as an AuthorizationStateClosed update.
-//   The old code called `client?.close()` and, without waiting for that update,
-//   immediately ran `dbDir.deleteRecursively()` and moved on to the next
-//   candidate. So across a run: (a) directory deletion could race a still-open
-//   native sqlite file handle, and (b) - more importantly - the native Td actor
-//   for that clientId was never confirmed torn down before we abandoned it and
-//   created a new one for the next candidate. dev.g000sha256's own
-//   TdlServiceLocator.kt shows the receiver thread, sender thread and the
-//   native ClientManager are process-wide singletons shared by every
-//   TdlClient.create() call - so this isn't "16/10 native processes", it's one
-//   shared native manager accumulating an ever-growing number of live,
-//   never-fully-closed Td actors (each still holding its own db handle,
-//   sockets, timers) as the scan progresses. That's a textbook native
-//   resource leak: it wouldn't crash at candidate 5, but it very plausibly
-//   crashes once enough candidates have piled up - exactly matching "same
-//   crash, just later" between 0.7.0 (16-way, ~49) and 0.7.1 (10-way, ~82).
-// Fix: after requesting close(), actually wait (with a bounded timeout, in
-// case a given proxy/candidate leaves TDLib wedged) for AuthorizationStateClosed
-// before touching that candidate's db directory or letting the semaphore admit
-// the next candidate. This makes native teardown a real precondition of moving
-// on, not a fire-and-forget. Concurrency is also dropped further (10->6) as a
-// safety margin on top of this, not as the fix itself.
-private suspend fun checkViaConnection(
-    filesDirPath: String,
-    index: Int,
-    candidate: Candidate,
-): ConnectResult? = withContext(Dispatchers.Default) {
-    coroutineScope {
-        val dbDir = File(filesDirPath, "tdlib-scan-$index")
-        val filesDirForClient = File(filesDirPath, "tdlib-scan-$index-files")
-        var client: TdlClient? = null
-        var collectorJob: kotlinx.coroutines.Job? = null
-        var authCollectorJob: kotlinx.coroutines.Job? = null
-        val closed = CompletableDeferred<Unit>()
-        try {
-            client = TdlClient.create()
-            val localClient = client
-            val ready = CompletableDeferred<Unit>()
-            collectorJob = localClient.connectionStateUpdates
-                .onEach { update -> if (update.state is ConnectionStateReady) ready.complete(Unit) }
-                .launchIn(this)
-            // Watched from the start (not just after close() is called) so a
-            // client that somehow reaches Closed on its own (e.g. TDLib-side
-            // error path) is still observed correctly.
-            authCollectorJob = localClient.authorizationStateUpdates
-                .onEach { update -> if (update.authorizationState is AuthorizationStateClosed) closed.complete(Unit) }
-                .launchIn(this)
+// Result of checking one candidate on a pool worker's persistent client: the
+// connect outcome (null = not reachable within the timeout / failed), plus the
+// id TDLib assigned this candidate's addProxy call (null if it was never
+// successfully added), so the caller knows what to removeProxy() before the
+// next candidate.
+private class PoolCheckOutcome(val result: ConnectResult?, val proxyId: Int?)
 
-            val paramsResult = localClient.setTdlibParameters(
+// v0.7.0 (16-way concurrency) crashed at candidate ~49/448. v0.7.1 ("catch
+// Throwable + delete per-candidate dirs", 10-way) crashed at ~82/450 - later,
+// not fixed. v0.7.2 ("wait for AuthorizationStateClosed before tearing down",
+// 6-way) crashed at ~96/450 - later again, still not fixed. All three shared
+// one architecture: a brand-new native TDLib client (and on-disk DB) was
+// created AND destroyed for every single one of ~450 candidates. Reading
+// dev.g000sha256:tdl-coroutines-android 14.0.0's own source
+// (TdlServiceLocator.kt, TdlEngine.kt) confirms the receiver thread, sender
+// thread and the native ClientManager backing every TdlClient.create() call
+// are process-wide singletons - so the real cost here was never "N native
+// processes", it was one shared native manager being asked to spin up and
+// tear down ~450 separate native Td actors (each with its own socket, sqlite
+// db, timers) over a single scan. Even with teardown done "correctly" (close()
+// + waiting for AuthorizationStateClosed, as v0.7.2 did), any small
+// per-teardown residual cost - a lingering allocation, a not-fully-released fd,
+// a growing internal table in ClientManager keyed by client id - accumulates
+// roughly linearly across hundreds of create/destroy cycles. That exactly
+// matches "crashes later but still crashes" as concurrency/wait-time
+// mitigations were tightened three times in a row.
+//
+// 0.8.0 fix: stop creating a client per candidate. TDLib's own API - confirmed
+// present in this wrapper version by reading TdlClient.kt - supports exactly
+// the proxy-switching operations a real Telegram client uses to let a user
+// change proxies without restarting: addProxy(proxy, enable, comment):
+// TdlResult<AddedProxy> (AddedProxy.id identifies it), removeProxy(proxyId),
+// enableProxy(proxyId), disableProxy(), getProxies(). So instead, a small
+// FIXED POOL of SCAN_CONCURRENCY clients is created ONCE at the start of a
+// scan and closed ONCE at the end (see runMassScan). Each pool worker below
+// owns one persistent client for its whole lifetime and just cycles that one
+// client's active proxy across its assigned candidates via
+// removeProxy()/addProxy() - no client teardown happens between candidates,
+// only at the very end of the run.
+//
+// connectionStateUpdates subtlety: TdlEngine.getUpdates() is backed by a hot,
+// non-replaying MutableSharedFlow shared process-wide and filtered by client
+// id (confirmed by reading TdlEngine.kt/TdlRepository.kt) - it is NOT a
+// StateFlow, so it never hands a late subscriber a stale cached state. This
+// worker still needs to guard against a *different* kind of staleness though:
+// if it re-subscribed to connectionStateUpdates fresh for every candidate,
+// a ConnectionStateReady left over from the *previous* candidate's proxy could
+// still be sitting unconsumed and get misread as this candidate's. The fix
+// here is to start exactly ONE persistent collector for the client's entire
+// lifetime, forwarding every state transition into an unbounded Channel, and
+// to drain (discard) whatever is already buffered in that channel immediately
+// before each candidate's removeProxy()/addProxy() call. Everything received
+// after that point is guaranteed to be a transition that happened at or after
+// this candidate's proxy switch - a stale Ready can never leak into the wait.
+private suspend fun runPoolWorker(
+    filesDirPath: String,
+    workerIndex: Int,
+    assigned: List<IndexedValue<Candidate>>,
+    totalSubset: Int,
+    checked: java.util.concurrent.atomic.AtomicInteger,
+    alive: java.util.concurrent.atomic.AtomicInteger,
+    onStatus: (String) -> Unit,
+    onAlive: (AliveHit) -> Unit,
+) = withContext(Dispatchers.Default) {
+    if (assigned.isEmpty()) return@withContext
+    coroutineScope {
+        val dbDir = File(filesDirPath, "tdlib-pool-$workerIndex")
+        val filesDirForClient = File(filesDirPath, "tdlib-pool-$workerIndex-files")
+        val client = TdlClient.create()
+        val closed = CompletableDeferred<Unit>()
+        // Unbounded so the persistent collector below never suspends/drops an
+        // event while this worker is off doing other suspend work (e.g.
+        // inside an addProxy() round trip) between reads.
+        val stateChannel = Channel<ConnectionState>(capacity = Channel.UNLIMITED)
+        val stateCollectorJob = client.connectionStateUpdates
+            .onEach { update -> stateChannel.trySend(update.state) }
+            .launchIn(this)
+        // Watched from client creation (not just after close() is requested) so
+        // a client that somehow reaches Closed on its own (e.g. a TDLib-side
+        // error path) is still observed correctly.
+        val authCollectorJob = client.authorizationStateUpdates
+            .onEach { update -> if (update.authorizationState is AuthorizationStateClosed) closed.complete(Unit) }
+            .launchIn(this)
+
+        try {
+            val paramsResult = client.setTdlibParameters(
                 useTestDc = false,
                 databaseDirectory = dbDir.absolutePath,
                 filesDirectory = filesDirForClient.absolutePath,
@@ -755,72 +790,154 @@ private suspend fun checkViaConnection(
                 systemVersion = "unknown",
                 applicationVersion = "0.1",
             )
-            if (paramsResult is TdlResult.Failure) return@coroutineScope null
-
-            val proxyType: ProxyType = ProxyTypeMtproto(secret = candidate.secret)
-            val proxy = Proxy(server = candidate.server, port = candidate.port, type = proxyType)
-            val addResult = localClient.addProxy(proxy = proxy, enable = true, comment = "mass-scan")
-            if (addResult is TdlResult.Failure) return@coroutineScope null
-
-            val start = android.os.SystemClock.elapsedRealtime()
-            val reached = withTimeoutOrNull(PER_PROXY_TIMEOUT_MS) { ready.await() } != null
-            if (!reached) return@coroutineScope null
-            val pingMs = android.os.SystemClock.elapsedRealtime() - start
-
-            // Speed metric removed here (see AliveHit doc comment): TDLib's
-            // NetworkStatistics never records pre-auth handshake bytes, so it
-            // always came back 0.0/0.0 and was worse than showing nothing.
-            ConnectResult(pingMs = pingMs, downloadKbps = null, uploadKbps = null)
-        } catch (e: Throwable) {
-            android.util.Log.e(
-                SCAN_TAG,
-                "checkViaConnection #$index (${candidate.server}:${candidate.port}) failed: " +
-                    "${e::class.simpleName}: ${e.message}",
-                e,
-            )
-            null
-        } finally {
-            try {
-                collectorJob?.cancel()
-            } catch (e: Throwable) {
-                android.util.Log.e(SCAN_TAG, "collectorJob.cancel #$index failed: ${e.message}", e)
+            if (paramsResult is TdlResult.Failure) {
+                android.util.Log.e(
+                    SCAN_TAG,
+                    "pool worker #$workerIndex setTdlibParameters failed: " +
+                        "${paramsResult.code} ${paramsResult.message} - " +
+                        "${assigned.size} candidates on this worker are unreachable",
+                )
+                // The client never came up, so every candidate assigned to this
+                // worker is unreachable - still advance `checked` for them so the
+                // on-screen "Проверено N/M" counter reaches subset.size instead
+                // of silently stalling short.
+                assigned.forEach { _ ->
+                    val checkedNow = checked.incrementAndGet()
+                    onStatus("Проверено $checkedNow/$totalSubset, живых сейчас: ${alive.get()}")
+                }
+                return@coroutineScope
             }
-            // The actual fix: close() only *requests* shutdown (see the doc
-            // comment above checkViaConnection) - wait for TDLib to confirm the
-            // native client actually finished tearing down before deleting its
-            // db files or letting the semaphore admit the next candidate. If
-            // that confirmation never arrives within CLOSE_TIMEOUT_MS (e.g. a
-            // wedged proxy connection), log it clearly - that candidate's
-            // native client may be leaking - and fall through to cleanup rather
-            // than hang the whole scan on one bad candidate.
-            if (client != null) {
-                try {
-                    client.close()
-                    val confirmedClosed = withTimeoutOrNull(CLOSE_TIMEOUT_MS) { closed.await() } != null
-                    if (!confirmedClosed) {
-                        android.util.Log.e(
-                            SCAN_TAG,
-                            "client.close #$index (${candidate.server}:${candidate.port}) did not confirm " +
-                                "AuthorizationStateClosed within ${CLOSE_TIMEOUT_MS}ms - possible native leak",
-                        )
-                    }
+
+            var lastProxyId: Int? = null
+            for ((candidateIndex, candidate) in assigned) {
+                val outcome = try {
+                    checkOneCandidate(
+                        client = client,
+                        stateChannel = stateChannel,
+                        previousProxyId = lastProxyId,
+                        candidate = candidate,
+                    )
                 } catch (e: Throwable) {
-                    android.util.Log.e(SCAN_TAG, "client.close #$index failed: ${e.message}", e)
+                    android.util.Log.e(
+                        SCAN_TAG,
+                        "candidate #$candidateIndex (${candidate.server}:${candidate.port}) crashed the check " +
+                            "on pool worker #$workerIndex: ${e::class.simpleName}: ${e.message}",
+                        e,
+                    )
+                    // Unknown state after a genuine crash - safest assumption is
+                    // "no proxy left active to clean up" rather than risk
+                    // removeProxy()-ing an id that may not even be valid.
+                    PoolCheckOutcome(result = null, proxyId = null)
+                }
+                lastProxyId = outcome.proxyId
+
+                val checkedNow = checked.incrementAndGet()
+                val result = outcome.result
+                if (result != null) {
+                    val aliveNow = alive.incrementAndGet()
+                    onAlive(
+                        AliveHit(
+                            candidate = candidate,
+                            pingMs = result.pingMs,
+                            downloadKbps = result.downloadKbps,
+                            uploadKbps = result.uploadKbps,
+                        )
+                    )
+                    onStatus("Проверено $checkedNow/$totalSubset, живых сейчас: $aliveNow")
+                } else {
+                    onStatus("Проверено $checkedNow/$totalSubset, живых сейчас: ${alive.get()}")
                 }
             }
+        } finally {
             try {
-                authCollectorJob?.cancel()
+                stateCollectorJob.cancel()
             } catch (e: Throwable) {
-                android.util.Log.e(SCAN_TAG, "authCollectorJob.cancel #$index failed: ${e.message}", e)
+                android.util.Log.e(SCAN_TAG, "pool worker #$workerIndex stateCollectorJob.cancel failed: ${e.message}", e)
+            }
+            // Same fix v0.7.2 shipped, now paid for once per pool worker instead
+            // of once per candidate: close() only *requests* shutdown (its own
+            // doc comment: "After the close completes, updateAuthorizationState
+            // with authorizationStateClosed will be sent" - the suspend function
+            // returning only means TDLib *received* the request). Wait for that
+            // confirmation, bounded, before deleting this worker's db files.
+            try {
+                client.close()
+                val confirmedClosed = withTimeoutOrNull(CLOSE_TIMEOUT_MS) { closed.await() } != null
+                if (!confirmedClosed) {
+                    android.util.Log.e(
+                        SCAN_TAG,
+                        "pool worker #$workerIndex client.close did not confirm AuthorizationStateClosed " +
+                            "within ${CLOSE_TIMEOUT_MS}ms - possible native leak",
+                    )
+                }
+            } catch (e: Throwable) {
+                android.util.Log.e(SCAN_TAG, "pool worker #$workerIndex client.close failed: ${e.message}", e)
+            }
+            try {
+                authCollectorJob.cancel()
+            } catch (e: Throwable) {
+                android.util.Log.e(SCAN_TAG, "pool worker #$workerIndex authCollectorJob.cancel failed: ${e.message}", e)
             }
             try {
                 dbDir.deleteRecursively()
                 filesDirForClient.deleteRecursively()
             } catch (e: Throwable) {
-                android.util.Log.e(SCAN_TAG, "cleanup of scan dirs #$index failed: ${e.message}", e)
+                android.util.Log.e(SCAN_TAG, "pool worker #$workerIndex cleanup of scan dirs failed: ${e.message}", e)
             }
         }
     }
+}
+
+// Runs on the pool worker's one persistent client - removes the previous
+// candidate's proxy (if any), adds this candidate's, and waits for
+// ConnectionStateReady via the worker's persistent state channel (see the
+// staleness note on runPoolWorker for why this is safe against a leftover
+// Ready from the previous candidate).
+private suspend fun checkOneCandidate(
+    client: TdlClient,
+    stateChannel: Channel<ConnectionState>,
+    previousProxyId: Int?,
+    candidate: Candidate,
+): PoolCheckOutcome {
+    if (previousProxyId != null) {
+        try {
+            client.removeProxy(proxyId = previousProxyId)
+        } catch (e: Throwable) {
+            android.util.Log.e(SCAN_TAG, "removeProxy($previousProxyId) failed: ${e.message}", e)
+        }
+    }
+
+    // Discard anything already buffered - a lingering Ready from the previous
+    // candidate, transitions kicked off by the removeProxy() above, etc. - so
+    // the wait below can only be satisfied by a transition that happens at or
+    // after this point.
+    while (stateChannel.tryReceive().isSuccess) {
+        // drain
+    }
+
+    val proxyType: ProxyType = ProxyTypeMtproto(secret = candidate.secret)
+    val proxy = Proxy(server = candidate.server, port = candidate.port, type = proxyType)
+    val addResult = client.addProxy(proxy = proxy, enable = true, comment = "mass-scan")
+    if (addResult is TdlResult.Failure) return PoolCheckOutcome(result = null, proxyId = null)
+    val newProxyId = (addResult as TdlResult.Success).result.id
+
+    val start = android.os.SystemClock.elapsedRealtime()
+    val reached = withTimeoutOrNull(PER_PROXY_TIMEOUT_MS) {
+        while (true) {
+            val state = stateChannel.receive()
+            if (state is ConnectionStateReady) break
+        }
+    } != null
+    if (!reached) return PoolCheckOutcome(result = null, proxyId = newProxyId)
+    val pingMs = android.os.SystemClock.elapsedRealtime() - start
+
+    // Speed metric removed here (see AliveHit doc comment): TDLib's
+    // NetworkStatistics never records pre-auth handshake bytes, so it
+    // always came back 0.0/0.0 and was worse than showing nothing.
+    return PoolCheckOutcome(
+        result = ConnectResult(pingMs = pingMs, downloadKbps = null, uploadKbps = null),
+        proxyId = newProxyId,
+    )
 }
 
 private suspend fun fetchJsonCandidates(url: String, jsonArrayKey: String): List<Candidate> =
