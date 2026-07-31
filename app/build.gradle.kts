@@ -37,8 +37,8 @@ android {
         // silently keep the already-installed APK instead of updating (confirmed:
         // v0.1.2 through v0.3.0 all shipped with this stuck at 2, so several
         // "updated" installs were actually still running old code).
-        versionCode = 20
-        versionName = "0.10.0-native-poc"
+        versionCode = 21
+        versionName = "0.10.1-native-poc"
         buildConfigField("int", "TG_API_ID", localProps.getProperty("tg.api_id", "0"))
         buildConfigField("String", "TG_API_HASH", "\"${localProps.getProperty("tg.api_hash", "")}\"")
     }
@@ -91,7 +91,11 @@ kotlin {
 }
 
 dependencies {
-    implementation("androidx.core:core-ktx:1.13.1")
+    // 1.19.0: setRequestPromotedOngoing()/NotificationCompat.ProgressStyle
+    // (Android 16 "Live Updates" - what powers Samsung One UI 8's Now Bar
+    // for third-party apps) shipped STABLE in 1.17.0 (Aug 2025), well before
+    // this bump - not an alpha dependency, contrary to earlier assumptions.
+    implementation("androidx.core:core-ktx:1.19.0")
     implementation("androidx.activity:activity-compose:1.9.0")
     implementation(platform("androidx.compose:compose-bom:2026.06.00"))
     implementation("androidx.compose.ui:ui")

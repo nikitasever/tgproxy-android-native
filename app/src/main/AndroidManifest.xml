@@ -7,6 +7,12 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <!-- Non-runtime permission gating Android 16 (API 36) "Live Updates" /
+         promoted-ongoing notifications - the mechanism behind Samsung One
+         UI's Now Bar for third-party apps as of One UI 8. No install-time
+         prompt; simply declaring it is what lets the scan-progress
+         notification below opt into promotion via setRequestPromotedOngoing. -->
+    <uses-permission android:name="android.permission.POST_PROMOTED_NOTIFICATIONS" />
 
     <application
         android:allowBackup="true"

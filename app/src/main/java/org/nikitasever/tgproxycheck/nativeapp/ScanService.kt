@@ -80,16 +80,36 @@ object ScanBridge {
 //
 // Notification approach: a standard NotificationCompat ongoing notification
 // with a determinate setProgress() bar, IMPORTANCE_LOW / silent channel, on
-// minSdk 24 through the current compileSdk 37. This is the well-supported,
+// minSdk 24 through the current compileSdk 37 - this is the well-supported,
 // broadly-compatible Android mechanism for "show ongoing task progress in
-// the status bar" - Android 16's newer Notification.ProgressStyle /
-// "Live Updates" (setRequestPromotedOngoing) template, which is what One
-// UI's Now Bar specifically looks for on a fully qualifying notification,
-// needs androidx.core 1.17.0-alpha01+ (the current stable core-ktx here is
-// 1.13.1) - deliberately not adopted yet so as not to pull an alpha
-// dependency into a release build over an already deployed, working
-// AGP/Kotlin/compileSdk chain. See the release notes / final report for the
-// honest read on whether this alone surfaces in Now Bar.
+// the status bar", and stays the notification shown on every OS version.
+//
+// On top of that, every notification here also requests promotion to an
+// Android 16 (API 36) "Live Update" via
+// NotificationCompat.Builder#setRequestPromotedOngoing(true) - this is the
+// actual, confirmed mechanism behind Samsung One UI's Now Bar for
+// third-party apps as of One UI 8 (which integrates Now Bar directly with
+// Android's platform Live Updates API rather than gating it behind a
+// Samsung-only allowlist or a hidden beta flag). Corrected understanding
+// vs. an earlier assumption in this codebase: setRequestPromotedOngoing()
+// shipped in androidx.core 1.17.0 STABLE in August 2025 (this project is on
+// 1.19.0 now), not stuck in alpha - so this is a safe, non-experimental
+// dependency bump.
+//
+// Requirements for promotion to actually take effect, all satisfied here:
+//   - android.permission.POST_PROMOTED_NOTIFICATIONS declared in the
+//     manifest (non-runtime, no prompt).
+//   - setOngoing(true) (already set on the progress notification).
+//   - Standard/no-style builder (no ProgressStyle/BigTextStyle needed -
+//     plain setProgress() already qualifies), no custom RemoteViews, not a
+//     group summary, not colorized, channel importance above IMPORTANCE_MIN
+//     (this channel is IMPORTANCE_LOW, which qualifies).
+// setRequestPromotedOngoing() is a no-op extra on pre-API-36 devices / on
+// launchers that don't understand it, so it's called unconditionally as a
+// safe superset of the existing notification - there's no separate
+// non-promoted code path to fall back to, because none is needed: an
+// unsupported OS or launcher just ignores the extra and shows the exact
+// same NotificationCompat notification as before this change.
 class ScanService : Service() {
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private var scanJob: Job? = null
@@ -151,6 +171,12 @@ class ScanService : Service() {
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .setProgress(total, checked, total <= 0)
             .setContentIntent(contentPendingIntent())
+            // Compact chip text for Live Update surfaces (e.g. Samsung Now
+            // Bar) that render a short status alongside/instead of the full
+            // contentText - see the class doc for why this is safe to
+            // request unconditionally.
+            .apply { if (total > 0) setShortCriticalText("$checked/$total") }
+            .setRequestPromotedOngoing(true)
             .build()
     }
 
