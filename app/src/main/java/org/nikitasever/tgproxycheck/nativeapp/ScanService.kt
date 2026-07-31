@@ -6,6 +6,7 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
 import android.content.Intent
+import android.content.pm.ServiceInfo
 import android.os.Build
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
@@ -223,7 +224,7 @@ class ScanService : Service() {
                 this,
                 SCAN_NOTIFICATION_ID,
                 buildProgressNotification(0, 0, null),
-                ServiceCompat.FOREGROUND_SERVICE_TYPE_DATA_SYNC,
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC,
             )
         } catch (e: Throwable) {
             android.util.Log.e(SCAN_SERVICE_TAG, "startForeground failed: ${e.message}", e)
