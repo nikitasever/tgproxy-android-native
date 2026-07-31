@@ -8,7 +8,9 @@
     <application
         android:allowBackup="true"
         android:label="TG Proxy Checker (native POC)"
-        android:theme="@android:style/Theme.Material.Light.NoActionBar">
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:theme="@android:style/Theme.Material.NoActionBar">
 
         <activity
             android:name=".MainActivity"

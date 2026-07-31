@@ -5,18 +5,34 @@ import android.net.Uri
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
-import androidx.compose.foundation.clickable
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.item
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.ColorScheme
 import androidx.compose.material3.Divider
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -24,11 +40,16 @@ import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.style.TextDecoration
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.core.content.FileProvider
 import java.io.File
 import dev.g000sha256.tdl.TdlClient
@@ -105,6 +126,16 @@ private val DOMAIN_CATEGORIES: List<Pair<String, List<String>>> = listOf(
 )
 
 private val CATEGORY_ORDER = listOf("RU", "EU", "US", "Asia", "Other")
+
+// Small decorative glyph shown per category chip - purely cosmetic, no effect
+// on classification/business logic.
+private fun categoryEmoji(category: String): String = when (category) {
+    "RU" -> "🇷🇺"
+    "EU" -> "🇪🇺"
+    "US" -> "🇺🇸"
+    "Asia" -> "🌏"
+    else -> "🌐"
+}
 
 private fun classifyDomain(domain: String?): String {
     if (domain.isNullOrEmpty()) return "Other"
@@ -391,12 +422,51 @@ private suspend fun downloadApk(url: String, destFile: File): Unit = withContext
     }
 }
 
+// Telegram-dark-mode-flavoured Material3 palette. Not the stock Material dark
+// scheme - background/surface/primary are pinned to specific hex values so the
+// app reads as "Telegram dark", not "default Compose dark theme".
+private val TgBackground = Color(0xFF0E1621)
+private val TgSurface = Color(0xFF17212B)
+private val TgSurfaceVariant = Color(0xFF1F2C38)
+private val TgAccent = Color(0xFF2AABEE)
+private val TgAccentDark = Color(0xFF229ED9)
+private val TgOnBackground = Color(0xFFE4E9EE)
+private val TgOnSurfaceMuted = Color(0xFF8A97A3)
+private val TgError = Color(0xFFF44336)
+
+private val TgColorScheme: ColorScheme = darkColorScheme(
+    primary = TgAccent,
+    onPrimary = Color.White,
+    secondary = TgAccentDark,
+    onSecondary = Color.White,
+    background = TgBackground,
+    onBackground = TgOnBackground,
+    surface = TgSurface,
+    onSurface = TgOnBackground,
+    surfaceVariant = TgSurfaceVariant,
+    onSurfaceVariant = TgOnSurfaceMuted,
+    error = TgError,
+    onError = Color.White,
+)
+
+// Ping thresholds for the colored badge - green/amber/red. Typical values seen
+// over hundreds of scanned MTProxy candidates from a real device run from well
+// under a second (fast, nearby/well-peered) up past 2-3s right before the
+// PER_PROXY_TIMEOUT_MS cutoff (slow/marginal), so 800ms/2000ms splits the
+// observed range into three roughly meaningful bands rather than being
+// arbitrary round numbers.
+private fun pingColor(pingMs: Long): Color = when {
+    pingMs < 800 -> Color(0xFF4CAF50)
+    pingMs < 2000 -> Color(0xFFFFC107)
+    else -> Color(0xFFF44336)
+}
+
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContent {
-            MaterialTheme {
-                Surface(modifier = Modifier.fillMaxSize()) {
+            MaterialTheme(colorScheme = TgColorScheme) {
+                Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
                     ProxyCheckScreen(filesDir.absolutePath)
                 }
             }
@@ -411,7 +481,6 @@ private fun formatLastScanTimestamp(timestampMs: Long): String {
 
 @Composable
 fun ProxyCheckScreen(filesDirPath: String) {
-    var status by remember { mutableStateOf("Готово") }
     val scope = remember { CoroutineScope(Dispatchers.Main) }
     val aliveResults = remember { mutableStateListOf<AliveHit>() }
     val context = LocalContext.current
@@ -422,6 +491,13 @@ fun ProxyCheckScreen(filesDirPath: String) {
 
     var lastScanInfo by remember { mutableStateOf<String?>(null) }
     var totalCheckedLast by remember { mutableStateOf(0) }
+    var everScanned by remember { mutableStateOf(false) }
+
+    // Progress/status state driving the header progress bar and scan button label.
+    var isScanning by remember { mutableStateOf(false) }
+    var scanChecked by remember { mutableStateOf(0) }
+    var scanTotal by remember { mutableStateOf(0) }
+    var statusLine by remember { mutableStateOf<String?>(null) }
 
     LaunchedEffect(Unit) {
         when (val result = checkForUpdate()) {
@@ -437,100 +513,201 @@ fun ProxyCheckScreen(filesDirPath: String) {
         if (snapshot != null) {
             aliveResults.addAll(snapshot.hits)
             totalCheckedLast = snapshot.totalChecked
+            everScanned = true
             lastScanInfo = "Последнее сканирование: ${snapshot.hits.size} из ${snapshot.totalChecked} " +
                 "живы (${formatLastScanTimestamp(snapshot.timestampMs)})"
         }
     }
 
-    Column(modifier = Modifier.fillMaxSize().padding(24.dp)) {
+    fun startScan() {
+        aliveResults.clear()
+        lastScanInfo = null
+        isScanning = true
+        everScanned = true
+        scanChecked = 0
+        scanTotal = 0
+        statusLine = "Загружаю список кандидатов..."
+        scope.launch {
+            // Belt-and-suspenders: runMassScan/checkViaConnection now catch
+            // Throwable internally so one bad candidate can't take the whole
+            // scan down, but this outer catch means even a truly unexpected
+            // failure surfaces as a status message instead of crashing the
+            // Activity's UI coroutine scope.
+            try {
+                runMassScan(
+                    filesDirPath,
+                    onStatus = { statusLine = it },
+                    onProgress = { checked, total ->
+                        scanChecked = checked
+                        scanTotal = total
+                    },
+                    onAlive = { aliveResults.add(it) },
+                    onComplete = { totalChecked ->
+                        totalCheckedLast = totalChecked
+                        saveLastScanResults(filesDirPath, totalChecked, aliveResults.toList())
+                        lastScanInfo = "Последнее сканирование: ${aliveResults.size} из $totalChecked " +
+                            "живы (${formatLastScanTimestamp(System.currentTimeMillis())})"
+                    },
+                )
+            } catch (e: Throwable) {
+                android.util.Log.e(SCAN_TAG, "runMassScan crashed: ${e::class.simpleName}: ${e.message}", e)
+                statusLine = "FAIL: сканирование прервано — ${e::class.simpleName}: ${e.message}"
+            } finally {
+                isScanning = false
+            }
+        }
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(MaterialTheme.colorScheme.background)
+            .padding(20.dp)
+    ) {
         if (updateInfo == null && updateCheckError != null) {
-            Text(text = "Не удалось проверить обновление: $updateCheckError")
+            Text(
+                text = "Не удалось проверить обновление: $updateCheckError",
+                color = TgOnSurfaceMuted,
+                fontSize = 12.sp,
+                modifier = Modifier.padding(bottom = 8.dp),
+            )
         }
         updateInfo?.let { info ->
-            Text(text = "Доступно обновление: v${info.version}${updateStatus?.let { " — $it" } ?: ""}")
-            Button(
-                modifier = Modifier.fillMaxWidth().padding(top = 8.dp, bottom = 16.dp),
-                onClick = {
-                    val needsInstallPermission = android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O &&
-                        !context.packageManager.canRequestPackageInstalls()
-                    if (needsInstallPermission) {
-                        updateStatus = "нужно разрешение на установку — открываю настройки"
-                        context.startActivity(
-                            Intent(
-                                android.provider.Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
-                                Uri.parse("package:${context.packageName}"),
-                            )
-                        )
-                        return@Button
-                    }
-                    scope.launch {
-                        updateStatus = "скачиваю..."
-                        try {
-                            val updatesDir = File(context.cacheDir, "updates").apply { mkdirs() }
-                            val apkFile = File(updatesDir, "update.apk")
-                            downloadApk(info.downloadUrl, apkFile)
-                            updateStatus = "устанавливаю..."
-                            val uri = FileProvider.getUriForFile(
-                                context,
-                                "org.nikitasever.tgproxycheck.nativeapp.fileprovider",
-                                apkFile,
-                            )
-                            val installIntent = Intent(Intent.ACTION_VIEW).apply {
-                                setDataAndType(uri, "application/vnd.android.package-archive")
-                                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                            }
-                            context.startActivity(installIntent)
-                        } catch (e: Exception) {
-                            updateStatus = "FAIL: ${e::class.simpleName}: ${e.message}"
-                        }
-                    }
-                },
+            Card(
+                modifier = Modifier.fillMaxWidth().padding(bottom = 16.dp),
+                shape = RoundedCornerShape(14.dp),
+                colors = CardDefaults.cardColors(containerColor = TgSurfaceVariant),
             ) {
-                Text("Обновить")
+                Column(modifier = Modifier.padding(14.dp)) {
+                    Text(
+                        text = "Доступно обновление: v${info.version}",
+                        color = MaterialTheme.colorScheme.onBackground,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                    updateStatus?.let {
+                        Text(text = it, color = TgOnSurfaceMuted, fontSize = 12.sp, modifier = Modifier.padding(top = 2.dp))
+                    }
+                    Button(
+                        modifier = Modifier.fillMaxWidth().padding(top = 10.dp),
+                        shape = RoundedCornerShape(10.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = TgAccent, contentColor = Color.White),
+                        onClick = {
+                            val needsInstallPermission = android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O &&
+                                !context.packageManager.canRequestPackageInstalls()
+                            if (needsInstallPermission) {
+                                updateStatus = "нужно разрешение на установку — открываю настройки"
+                                context.startActivity(
+                                    Intent(
+                                        android.provider.Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                                        Uri.parse("package:${context.packageName}"),
+                                    )
+                                )
+                                return@Button
+                            }
+                            scope.launch {
+                                updateStatus = "скачиваю..."
+                                try {
+                                    val updatesDir = File(context.cacheDir, "updates").apply { mkdirs() }
+                                    val apkFile = File(updatesDir, "update.apk")
+                                    downloadApk(info.downloadUrl, apkFile)
+                                    updateStatus = "устанавливаю..."
+                                    val uri = FileProvider.getUriForFile(
+                                        context,
+                                        "org.nikitasever.tgproxycheck.nativeapp.fileprovider",
+                                        apkFile,
+                                    )
+                                    val installIntent = Intent(Intent.ACTION_VIEW).apply {
+                                        setDataAndType(uri, "application/vnd.android.package-archive")
+                                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                    }
+                                    context.startActivity(installIntent)
+                                } catch (e: Exception) {
+                                    updateStatus = "FAIL: ${e::class.simpleName}: ${e.message}"
+                                }
+                            }
+                        },
+                    ) {
+                        Text("Обновить")
+                    }
+                }
             }
-            Divider(modifier = Modifier.padding(bottom = 12.dp))
         }
 
-        Text(text = status)
-
-        lastScanInfo?.let { info ->
-            Text(text = info, modifier = Modifier.padding(top = 4.dp))
+        // Header: active progress bar while scanning, otherwise a rest-state
+        // summary of the last completed scan.
+        if (isScanning) {
+            Column(modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp)) {
+                if (scanTotal > 0) {
+                    LinearProgressIndicator(
+                        progress = { scanChecked.toFloat() / scanTotal.toFloat() },
+                        modifier = Modifier.fillMaxWidth().height(6.dp).clip(RoundedCornerShape(3.dp)),
+                        color = TgAccent,
+                        trackColor = TgSurfaceVariant,
+                    )
+                } else {
+                    LinearProgressIndicator(
+                        modifier = Modifier.fillMaxWidth().height(6.dp).clip(RoundedCornerShape(3.dp)),
+                        color = TgAccent,
+                        trackColor = TgSurfaceVariant,
+                    )
+                }
+                statusLine?.let {
+                    Text(
+                        text = it,
+                        color = TgOnSurfaceMuted,
+                        fontSize = 12.sp,
+                        modifier = Modifier.padding(top = 6.dp),
+                    )
+                }
+            }
+        } else {
+            statusLine?.takeIf { it.startsWith("FAIL") }?.let {
+                Text(
+                    text = it,
+                    color = TgError,
+                    fontSize = 12.sp,
+                    modifier = Modifier.padding(bottom = 6.dp),
+                )
+            }
+            lastScanInfo?.let { info ->
+                Text(
+                    text = info,
+                    color = TgOnSurfaceMuted,
+                    fontSize = 13.sp,
+                    modifier = Modifier.padding(bottom = 8.dp),
+                )
+            }
         }
 
         Button(
-            modifier = Modifier.fillMaxWidth().padding(top = 12.dp),
-            onClick = {
-                aliveResults.clear()
-                lastScanInfo = null
-                status = "Загружаю список кандидатов..."
-                scope.launch {
-                    // Belt-and-suspenders: runMassScan/checkViaConnection now catch
-                    // Throwable internally so one bad candidate can't take the whole
-                    // scan down, but this outer catch means even a truly unexpected
-                    // failure surfaces as a status message instead of crashing the
-                    // Activity's UI coroutine scope.
-                    try {
-                        runMassScan(
-                            filesDirPath,
-                            onStatus = { status = it },
-                            onAlive = { aliveResults.add(it) },
-                            onComplete = { totalChecked ->
-                                totalCheckedLast = totalChecked
-                                saveLastScanResults(filesDirPath, totalChecked, aliveResults.toList())
-                            },
-                        )
-                    } catch (e: Throwable) {
-                        android.util.Log.e(SCAN_TAG, "runMassScan crashed: ${e::class.simpleName}: ${e.message}", e)
-                        status = "FAIL: сканирование прервано — ${e::class.simpleName}: ${e.message}"
-                    }
-                }
-            },
+            modifier = Modifier.fillMaxWidth().height(48.dp),
+            enabled = !isScanning,
+            shape = RoundedCornerShape(12.dp),
+            colors = ButtonDefaults.buttonColors(
+                containerColor = TgAccent,
+                contentColor = Color.White,
+                disabledContainerColor = TgSurfaceVariant,
+                disabledContentColor = TgOnSurfaceMuted,
+            ),
+            onClick = { startScan() },
         ) {
-            Text("Массовое сканирование")
+            if (isScanning) {
+                CircularProgressIndicator(
+                    modifier = Modifier.size(18.dp),
+                    color = TgOnSurfaceMuted,
+                    strokeWidth = 2.dp,
+                )
+                Spacer(modifier = Modifier.width(10.dp))
+                Text(
+                    if (scanTotal > 0) "Сканирование… $scanChecked/$scanTotal" else "Сканирование…",
+                )
+            } else {
+                Text("Массовое сканирование")
+            }
         }
 
-        Divider(modifier = Modifier.padding(vertical = 12.dp))
+        Spacer(modifier = Modifier.height(16.dp))
 
         // Belt-and-suspenders dedup (see proxyIdentityKey doc comment): the real
         // fix is scanning each proxy only once (runMassScan's `key()`), but this
@@ -547,75 +724,212 @@ fun ProxyCheckScreen(filesDirPath: String) {
             .groupBy { it.candidate.category }
             .mapValues { (_, hits) -> hits.sortedBy { it.recommendScore() } }
 
-        fun hitLine(hit: AliveHit): String {
-            val tag = if (hit.candidate.isProtectedDomain) " [защищённый домен]" else ""
-            // Speed (КБ/с) metric was removed in 0.7.1 - it always read 0.0/0.0 for
-            // structural reasons (see AliveHit doc comment), so it's dishonest to show.
-            // Only show it for legacy persisted results from before the removal that
-            // happen to still have real (non-null) values loaded from disk.
-            val speedText = if (hit.downloadKbps != null && hit.uploadKbps != null) {
-                " — ↓%.1f/↑%.1f КБ/с (устаревшие данные)".format(hit.downloadKbps, hit.uploadKbps)
-            } else ""
-            return "✓ ${hit.candidate.server}:${hit.candidate.port}$tag — ${hit.pingMs}мс$speedText — добавить в Telegram"
+        fun addToTelegram(hit: AliveHit) {
+            val intent = Intent(Intent.ACTION_VIEW, Uri.parse(hit.candidate.toTelegramProxyUrl()))
+            context.startActivity(intent)
         }
 
-        LazyColumn {
-            if (recommended.isNotEmpty()) {
-                item(key = "header-recommended") {
-                    Text(
-                        text = "⭐ Рекомендуем (${recommended.size})",
-                        fontWeight = FontWeight.Bold,
-                        modifier = Modifier.fillMaxWidth().padding(top = 4.dp, bottom = 4.dp),
-                    )
-                }
-                // Key includes the full normalized proxy identity (not just
-                // server:port - see proxyIdentityKey doc comment for why that
-                // alone caused the v0.8.0 crash) PLUS the index as an absolute
-                // safety net: even if some future bug ever produced two
-                // AliveHits with a truly identical identity, the index still
-                // guarantees Compose never sees a duplicate key.
-                itemsIndexed(recommended, key = { index, hit -> "rec-$index-${proxyIdentityKey(hit.candidate)}" }) { _, hit ->
-                    Text(
-                        text = hitLine(hit),
-                        textDecoration = TextDecoration.Underline,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(vertical = 8.dp)
-                            .clickable {
-                                val intent = Intent(Intent.ACTION_VIEW, Uri.parse(hit.candidate.toTelegramProxyUrl()))
-                                context.startActivity(intent)
-                            },
-                    )
-                }
-                item(key = "recommended-divider") {
-                    Divider(modifier = Modifier.padding(vertical = 12.dp))
-                }
+        if (!isScanning && everScanned && dedupedAlive.isEmpty()) {
+            // Scan ran but found nothing alive right now - distinct from the
+            // never-scanned empty state below.
+            Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                Text(
+                    text = "Живых прокси не найдено в этот раз. Попробуйте ещё раз позже.",
+                    color = TgOnSurfaceMuted,
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier.padding(horizontal = 24.dp),
+                )
             }
+        } else if (!everScanned && !isScanning) {
+            EmptyFirstLaunchState()
+        } else {
+            LazyColumn(modifier = Modifier.fillMaxSize()) {
+                if (recommended.isNotEmpty()) {
+                    item(key = "header-recommended") {
+                        RecommendedPanel(recommended = recommended, onAdd = ::addToTelegram)
+                        Spacer(modifier = Modifier.height(16.dp))
+                    }
+                }
 
-            for (category in CATEGORY_ORDER) {
-                val hits = grouped[category] ?: continue
-                if (hits.isEmpty()) continue
-                item(key = "header-$category") {
-                    Text(
-                        text = "$category (${hits.size})",
-                        fontWeight = FontWeight.Bold,
-                        modifier = Modifier.fillMaxWidth().padding(top = 12.dp, bottom = 4.dp),
-                    )
-                }
-                itemsIndexed(hits, key = { index, hit -> "cat-$category-$index-${proxyIdentityKey(hit.candidate)}" }) { _, hit ->
-                    Text(
-                        text = hitLine(hit),
-                        textDecoration = TextDecoration.Underline,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(vertical = 8.dp)
-                            .clickable {
-                                val intent = Intent(Intent.ACTION_VIEW, Uri.parse(hit.candidate.toTelegramProxyUrl()))
-                                context.startActivity(intent)
-                            },
-                    )
+                for (category in CATEGORY_ORDER) {
+                    val hits = grouped[category] ?: continue
+                    if (hits.isEmpty()) continue
+                    item(key = "header-$category") {
+                        Row(
+                            modifier = Modifier.fillMaxWidth().padding(top = 4.dp, bottom = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Text(text = categoryEmoji(category), fontSize = 16.sp)
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text(
+                                text = "$category (${hits.size})",
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.onBackground,
+                                fontSize = 14.sp,
+                            )
+                        }
+                    }
+                    // Key includes the full normalized proxy identity (not just
+                    // server:port - see proxyIdentityKey doc comment for why that
+                    // alone caused the v0.8.0 crash) PLUS the index as an absolute
+                    // safety net: even if some future bug ever produced two
+                    // AliveHits with a truly identical identity, the index still
+                    // guarantees Compose never sees a duplicate key.
+                    itemsIndexed(hits, key = { index, hit -> "cat-$category-$index-${proxyIdentityKey(hit.candidate)}" }) { _, hit ->
+                        ProxyCard(hit = hit, onAdd = { addToTelegram(hit) }, modifier = Modifier.padding(bottom = 10.dp))
+                    }
+                    item(key = "spacer-$category") {
+                        Spacer(modifier = Modifier.height(6.dp))
+                    }
                 }
             }
+        }
+    }
+}
+
+@Composable
+private fun EmptyFirstLaunchState() {
+    Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            Text(text = "🔍", fontSize = 48.sp)
+            Spacer(modifier = Modifier.height(12.dp))
+            Text(
+                text = "Нажми, чтобы найти рабочие прокси",
+                color = MaterialTheme.colorScheme.onBackground,
+                fontSize = 16.sp,
+                fontWeight = FontWeight.Medium,
+                textAlign = TextAlign.Center,
+            )
+            Spacer(modifier = Modifier.height(6.dp))
+            Text(
+                text = "Массовое сканирование проверит сотни MTProto-прокси и покажет, какие живы прямо сейчас",
+                color = TgOnSurfaceMuted,
+                fontSize = 13.sp,
+                textAlign = TextAlign.Center,
+                modifier = Modifier.padding(horizontal = 32.dp),
+            )
+        }
+    }
+}
+
+@Composable
+private fun PingBadge(pingMs: Long) {
+    val color = pingColor(pingMs)
+    Surface(
+        color = color.copy(alpha = 0.16f),
+        shape = RoundedCornerShape(8.dp),
+    ) {
+        Text(
+            text = "${pingMs} мс",
+            color = color,
+            fontSize = 12.sp,
+            fontWeight = FontWeight.SemiBold,
+            modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp),
+        )
+    }
+}
+
+@Composable
+private fun ProtectedDomainChip() {
+    Surface(
+        color = TgAccent.copy(alpha = 0.16f),
+        shape = RoundedCornerShape(8.dp),
+    ) {
+        Text(
+            text = "защищённый домен",
+            color = TgAccent,
+            fontSize = 11.sp,
+            modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp),
+        )
+    }
+}
+
+// Row content shared by both the plain per-category cards and the recommended
+// panel (which supplies its own outer background, so the row itself stays
+// transparent there).
+@Composable
+private fun ProxyRowContent(hit: AliveHit, onAdd: () -> Unit) {
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(vertical = 12.dp, horizontal = 14.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(text = categoryEmoji(hit.candidate.category), fontSize = 18.sp)
+        Spacer(modifier = Modifier.width(10.dp))
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = "${hit.candidate.server}:${hit.candidate.port}",
+                fontWeight = FontWeight.Bold,
+                fontSize = 15.sp,
+                color = MaterialTheme.colorScheme.onBackground,
+            )
+            Spacer(modifier = Modifier.height(6.dp))
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                PingBadge(hit.pingMs)
+                if (hit.candidate.isProtectedDomain) {
+                    Spacer(modifier = Modifier.width(6.dp))
+                    ProtectedDomainChip()
+                }
+            }
+        }
+        Spacer(modifier = Modifier.width(12.dp))
+        Button(
+            onClick = onAdd,
+            shape = RoundedCornerShape(10.dp),
+            colors = ButtonDefaults.buttonColors(containerColor = TgAccent, contentColor = Color.White),
+            contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 14.dp, vertical = 8.dp),
+        ) {
+            Text("Добавить", fontSize = 13.sp)
+        }
+    }
+}
+
+@Composable
+private fun ProxyCard(hit: AliveHit, onAdd: () -> Unit, modifier: Modifier = Modifier) {
+    Card(
+        modifier = modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(14.dp),
+        colors = CardDefaults.cardColors(containerColor = TgSurface),
+        elevation = CardDefaults.cardElevation(defaultElevation = 1.dp),
+    ) {
+        ProxyRowContent(hit = hit, onAdd = onAdd)
+    }
+}
+
+// The recommended section gets a visually distinct panel - accent border plus a
+// subtle tinted gradient background - so it reads as clearly more important
+// than the plain per-category cards below it.
+@Composable
+private fun RecommendedPanel(recommended: List<AliveHit>, onAdd: (AliveHit) -> Unit) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(16.dp),
+        colors = CardDefaults.cardColors(containerColor = Color.Transparent),
+        border = BorderStroke(1.5.dp, TgAccent),
+        elevation = CardDefaults.cardElevation(defaultElevation = 0.dp),
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .background(
+                    Brush.verticalGradient(
+                        colors = listOf(TgAccent.copy(alpha = 0.20f), TgAccent.copy(alpha = 0.05f)),
+                    )
+                ),
+        ) {
+            Text(
+                text = "⭐ Рекомендуем (${recommended.size})",
+                fontWeight = FontWeight.Bold,
+                fontSize = 15.sp,
+                color = Color.White,
+                modifier = Modifier.padding(start = 14.dp, top = 14.dp, bottom = 4.dp),
+            )
+            recommended.forEachIndexed { index, hit ->
+                ProxyRowContent(hit = hit, onAdd = { onAdd(hit) })
+                if (index != recommended.lastIndex) {
+                    Divider(color = Color.White.copy(alpha = 0.08f), modifier = Modifier.padding(horizontal = 14.dp))
+                }
+            }
+            Spacer(modifier = Modifier.height(6.dp))
         }
     }
 }
@@ -623,6 +937,7 @@ fun ProxyCheckScreen(filesDirPath: String) {
 private suspend fun runMassScan(
     filesDirPath: String,
     onStatus: (String) -> Unit,
+    onProgress: (checked: Int, total: Int) -> Unit,
     onAlive: (AliveHit) -> Unit,
     onComplete: (totalChecked: Int) -> Unit = {},
 ) {
@@ -657,6 +972,7 @@ private suspend fun runMassScan(
         "Кандидатов: ${verified.size} verified + ${raw.size} сырых, " +
             "защищённых доменов: ${protected.size}, проверяю ${subset.size}..."
     )
+    onProgress(0, subset.size)
 
     if (subset.isEmpty()) {
         onStatus("Готово: нет кандидатов для проверки")
@@ -710,6 +1026,7 @@ private suspend fun runMassScan(
                         checked = checked,
                         alive = alive,
                         onStatus = onStatus,
+                        onProgress = onProgress,
                         onAlive = onAlive,
                     )
                 } catch (e: Throwable) {
@@ -791,6 +1108,7 @@ private suspend fun runPoolWorker(
     checked: java.util.concurrent.atomic.AtomicInteger,
     alive: java.util.concurrent.atomic.AtomicInteger,
     onStatus: (String) -> Unit,
+    onProgress: (checked: Int, total: Int) -> Unit,
     onAlive: (AliveHit) -> Unit,
 ) = withContext(Dispatchers.Default) {
     if (assigned.isEmpty()) return@withContext
@@ -844,6 +1162,7 @@ private suspend fun runPoolWorker(
                 assigned.forEach { _ ->
                     val checkedNow = checked.incrementAndGet()
                     onStatus("Проверено $checkedNow/$totalSubset, живых сейчас: ${alive.get()}")
+                    onProgress(checkedNow, totalSubset)
                 }
                 return@coroutineScope
             }
@@ -887,6 +1206,7 @@ private suspend fun runPoolWorker(
                 } else {
                     onStatus("Проверено $checkedNow/$totalSubset, живых сейчас: ${alive.get()}")
                 }
+                onProgress(checkedNow, totalSubset)
             }
         } finally {
             try {
