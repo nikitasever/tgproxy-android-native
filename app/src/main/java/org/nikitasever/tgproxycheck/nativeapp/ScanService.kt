@@ -32,6 +32,12 @@ private const val SCAN_NOTIFICATION_ID = 1001
 // nobody can perceive a status-bar text change faster than this anyway.
 private const val NOTIFICATION_THROTTLE_MS = 400L
 
+// Telegram-blue accent (matches TgAccent in MainActivity.kt's Compose theme)
+// used for the colorized progress notification - see the setColorized(true)
+// note on buildProgressNotification() for why a colorized notification
+// needs an explicit color at all.
+private val TG_ACCENT_COLOR = android.graphics.Color.parseColor("#2AABEE")
+
 const val ACTION_START_SCAN = "org.nikitasever.tgproxycheck.nativeapp.action.START_SCAN"
 
 // Everything the UI needs to render the scan header/results, mirrored between
@@ -96,14 +102,58 @@ object ScanBridge {
 // 1.19.0 now), not stuck in alpha - so this is a safe, non-experimental
 // dependency bump.
 //
-// Requirements for promotion to actually take effect, all satisfied here:
+// Requirements for promotion to actually take effect - corrected AGAIN
+// after live on-device testing (adb dumpsys notification --noredact on a
+// real S23) showed mIsPromotion=false despite the permission being granted,
+// the AppOp being allowed, and android.requestPromotedOngoing=true/
+// PROMOTED_ONGOING flag both present. developer.android.com's "Create live
+// update notifications" page claims colorized must NOT be true - that page
+// is simply wrong (or describes a different/older gate). The real,
+// ground-truth check is Notification#hasPromotableCharacteristics() in
+// AOSP frameworks/base (core/java/android/app/Notification.java, current
+// main branch):
+//
+//   public boolean hasPromotableCharacteristics() {
+//       return isColorizedRequested()
+//               && isOngoingEvent()
+//               && hasTitle()
+//               && !isGroupSummary()
+//               && !containsCustomViews()
+//               && hasPromotableStyle();
+//   }
+//
+// where isColorizedRequested() is just `extras.getBoolean(EXTRA_COLORIZED)`
+// - i.e. whether the notification called setColorized(true) at all, not
+// whether it's actually rendered colorized (that additionally needs FGS/
+// USE_COLORIZED_NOTIFICATIONS/already-promoted, per isColorized()). Our
+// notification never called setColorized(true), so isColorizedRequested()
+// was false, so hasPromotableCharacteristics() - and therefore
+// mIsPromotion - was false regardless of everything else being correct.
+// hasPromotableStyle() confirms a plain/no-style builder (our case) is
+// fine: notificationStyle == null is explicitly allowed alongside
+// BigPictureStyle/BigTextStyle/CallStyle/ProgressStyle, so ProgressStyle
+// was never actually required.
+//
+// Fix: add setColorized(true) (+ an explicit setColor(), since a colorized
+// notification with no color falls back to a generic system tint) to the
+// progress notification only - the one/only notification that also calls
+// setRequestPromotedOngoing(true). setColorized(true) on a foreground
+// service's notification doesn't need the USE_COLORIZED_NOTIFICATIONS
+// permission to be *requested*; the platform additionally grants FGS
+// notifications leeway to actually render colorized (isFgsOrUij() in
+// isColorized()), so this is safe to call unconditionally here.
+//
+// Other requirements, all already satisfied:
 //   - android.permission.POST_PROMOTED_NOTIFICATIONS declared in the
 //     manifest (non-runtime, no prompt).
 //   - setOngoing(true) (already set on the progress notification).
-//   - Standard/no-style builder (no ProgressStyle/BigTextStyle needed -
-//     plain setProgress() already qualifies), no custom RemoteViews, not a
-//     group summary, not colorized, channel importance above IMPORTANCE_MIN
-//     (this channel is IMPORTANCE_LOW, which qualifies).
+//   - contentTitle set.
+//   - no custom RemoteViews, not a group summary.
+//   - channel importance above IMPORTANCE_MIN (this channel is
+//     IMPORTANCE_LOW, which qualifies per both the docs and the source -
+//     hasPromotableCharacteristics() itself has no importance check at
+//     all; channel importance is a *separate*, additional gate enforced
+//     elsewhere in NotificationManagerService, not in this method).
 // setRequestPromotedOngoing() is a no-op extra on pre-API-36 devices / on
 // launchers that don't understand it, so it's called unconditionally as a
 // safe superset of the existing notification - there's no separate
@@ -177,6 +227,12 @@ class ScanService : Service() {
             // request unconditionally.
             .apply { if (total > 0) setShortCriticalText("$checked/$total") }
             .setRequestPromotedOngoing(true)
+            // Required for Notification#hasPromotableCharacteristics() to
+            // return true (see the class doc above) - without this the
+            // system silently refuses to promote the notification
+            // (mIsPromotion stays false) no matter what else is set.
+            .setColorized(true)
+            .setColor(TG_ACCENT_COLOR)
             .build()
     }
 
