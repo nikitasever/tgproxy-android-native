@@ -32,13 +32,19 @@ android {
         // ("native" alone is a reserved Java keyword, hence "nativeapp".)
         applicationId = "org.nikitasever.tgproxycheck.nativeapp"
         minSdk = 24
-        targetSdk = 37
+        // targetSdk pinned to 36 (Android 16, "Baklava") to exactly match the
+        // shipped OS on the test device (One UI 8.5) rather than 37 (a future/
+        // preview level) - testing whether Samsung's Live-Update promotion gate
+        // (mIsPromotion) is keyed off exact targetSdkVersion rather than just the
+        // device's runtime API level. compileSdk stays 37 (required by the TDLib
+        // wrapper's AGP/Kotlin chain) - only the app's declared target changes.
+        targetSdk = 36
         // Bump both on every release build - an unchanged versionCode makes Android
         // silently keep the already-installed APK instead of updating (confirmed:
         // v0.1.2 through v0.3.0 all shipped with this stuck at 2, so several
         // "updated" installs were actually still running old code).
-        versionCode = 22
-        versionName = "0.10.2-native-poc"
+        versionCode = 23
+        versionName = "0.10.3-native-poc"
         buildConfigField("int", "TG_API_ID", localProps.getProperty("tg.api_id", "0"))
         buildConfigField("String", "TG_API_HASH", "\"${localProps.getProperty("tg.api_hash", "")}\"")
     }
