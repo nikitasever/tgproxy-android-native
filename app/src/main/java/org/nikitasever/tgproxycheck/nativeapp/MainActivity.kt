@@ -75,6 +75,7 @@ import kotlinx.coroutines.flow.launchIn
 import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONArray
 import java.security.SecureRandom
@@ -370,6 +371,32 @@ sealed class UpdateCheckResult {
     data class Error(val message: String) : UpdateCheckResult()
 }
 
+// Parses the "major.minor.patch" numeric prefix of a version string, ignoring
+// any "-native-poc"-style suffix. Missing/non-numeric components default to 0
+// rather than throwing, so a malformed tag_name degrades to "0.0.0" instead of
+// crashing the update check.
+private fun parseVersionParts(version: String): Triple<Int, Int, Int> {
+    val core = version.substringBefore('-')
+    val parts = core.split(".").map { it.toIntOrNull() ?: 0 }
+    return Triple(parts.getOrElse(0) { 0 }, parts.getOrElse(1) { 0 }, parts.getOrElse(2) { 0 })
+}
+
+// Component-wise numeric comparison (NOT string comparison - "0.9.0" must not
+// compare greater than "0.10.0"). Returns true only if `remote` is strictly
+// newer than `local`; equal or older versions (including exact byte-for-byte
+// re-releases of the same tag) are never reported as an update. This is what
+// closed the bug where a strictly OLDER already-superseded release (e.g.
+// v0.10.2) got offered as an "update" over a manually-installed newer local
+// build (e.g. 0.10.3) purely because the old code did `tag != current` instead
+// of an actual newer-than check.
+internal fun isVersionNewer(remote: String, local: String): Boolean {
+    val (rMajor, rMinor, rPatch) = parseVersionParts(remote)
+    val (lMajor, lMinor, lPatch) = parseVersionParts(local)
+    if (rMajor != lMajor) return rMajor > lMajor
+    if (rMinor != lMinor) return rMinor > lMinor
+    return rPatch > lPatch
+}
+
 private suspend fun checkForUpdate(): UpdateCheckResult = withContext(Dispatchers.IO) {
     try {
         val connection = java.net.URL(GITHUB_LATEST_RELEASE_URL).openConnection() as HttpsURLConnection
@@ -392,7 +419,9 @@ private suspend fun checkForUpdate(): UpdateCheckResult = withContext(Dispatcher
         val body = connection.inputStream.bufferedReader().use { it.readText() }
         val root = org.json.JSONObject(body)
         val tagName = root.getString("tag_name").removePrefix("v")
-        if (tagName == BuildConfig.VERSION_NAME) return@withContext UpdateCheckResult.UpToDate
+        if (!isVersionNewer(remote = tagName, local = BuildConfig.VERSION_NAME)) {
+            return@withContext UpdateCheckResult.UpToDate
+        }
 
         val assets = root.getJSONArray("assets")
         var downloadUrl: String? = null
@@ -415,6 +444,11 @@ private suspend fun checkForUpdate(): UpdateCheckResult = withContext(Dispatcher
         UpdateCheckResult.Error(message)
     }
 }
+
+// Overall wall-clock cap on the download step, separate from the per-socket-op
+// connect/read timeouts inside downloadApk() - see the call site in
+// ProxyCheckScreen for why this is needed to prevent an indefinite hang.
+private const val APK_DOWNLOAD_TIMEOUT_MS = 120_000L
 
 private suspend fun downloadApk(url: String, destFile: File): Unit = withContext(Dispatchers.IO) {
     val connection = java.net.URL(url).openConnection() as HttpsURLConnection
@@ -515,6 +549,19 @@ fun ProxyCheckScreen(filesDirPath: String) {
         ActivityResultContracts.RequestPermission()
     ) { /* granted or not, the scan proceeds regardless */ }
 
+    // Root cause of the "устанавливаю..." hang that never recovered: the old code
+    // fired the install intent with a bare context.startActivity() and never
+    // touched updateStatus again on the success path - only the catch block reset
+    // it, so a *successful* launch of the system package-installer UI (the
+    // overwhelmingly common case) left the banner stuck on "устанавливаю..."
+    // forever with no way back to idle. Launching it through an ActivityResult
+    // contract instead means this callback fires when the installer activity
+    // returns control to us (installed, cancelled, or failed) and unconditionally
+    // clears the state - there is no code path anymore that leaves the UI wedged.
+    val installLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { updateStatus = null }
+
     LaunchedEffect(Unit) {
         when (val result = checkForUpdate()) {
             is UpdateCheckResult.Available -> updateInfo = result.info
@@ -603,7 +650,16 @@ fun ProxyCheckScreen(filesDirPath: String) {
                                 try {
                                     val updatesDir = File(context.cacheDir, "updates").apply { mkdirs() }
                                     val apkFile = File(updatesDir, "update.apk")
-                                    downloadApk(info.downloadUrl, apkFile)
+                                    // Bounded overall download time: the connection's own
+                                    // connect/read timeouts only bound a single socket
+                                    // operation, not the whole transfer, so a slow trickle
+                                    // could otherwise stall here indefinitely. On timeout
+                                    // this throws TimeoutCancellationException, which the
+                                    // catch below turns into a visible FAIL instead of an
+                                    // unbounded hang.
+                                    withTimeout(APK_DOWNLOAD_TIMEOUT_MS) {
+                                        downloadApk(info.downloadUrl, apkFile)
+                                    }
                                     updateStatus = "устанавливаю..."
                                     val uri = FileProvider.getUriForFile(
                                         context,
@@ -613,9 +669,13 @@ fun ProxyCheckScreen(filesDirPath: String) {
                                     val installIntent = Intent(Intent.ACTION_VIEW).apply {
                                         setDataAndType(uri, "application/vnd.android.package-archive")
                                         addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                                     }
-                                    context.startActivity(installIntent)
+                                    // Launched via the ActivityResult contract (not a bare
+                                    // startActivity) so installLauncher's callback above can
+                                    // reset updateStatus once the installer returns control
+                                    // to us - see the doc comment on installLauncher for why
+                                    // that's the actual fix for the indefinite hang.
+                                    installLauncher.launch(installIntent)
                                 } catch (e: Exception) {
                                     updateStatus = "FAIL: ${e::class.simpleName}: ${e.message}"
                                 }
@@ -832,7 +892,19 @@ private fun ProtectedDomainChip() {
         Text(
             text = "защищённый домен",
             color = TgAccent,
-            fontSize = 11.sp,
+            // 10sp (down from 11sp) plus maxLines/overflow below is what actually
+            // fixes the misaligned rows: at 11sp this chip could wrap to two lines
+            // whenever the surrounding row was tight on width (e.g. a long
+            // server hostname), which made that specific card's row taller than
+            // its neighbours and threw off the visual rhythm of the list even
+            // though everything inside the row was still individually centered.
+            // Forcing a single line keeps every row's height - and therefore the
+            // vertical centering of the emoji/badge/button against it -
+            // consistent regardless of server name length.
+            fontSize = 10.sp,
+            maxLines = 1,
+            softWrap = false,
+            overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
             modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp),
         )
     }
@@ -847,6 +919,12 @@ private fun ProxyRowContent(hit: AliveHit, onAdd: () -> Unit) {
         modifier = Modifier.fillMaxWidth().padding(vertical = 12.dp, horizontal = 14.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
+        // Emoji and button are direct children of the outer CenterVertically Row,
+        // so they stay vertically centered against the full row height even on
+        // the rare row where the middle Column still ends up taller (e.g. an
+        // unusually long server hostname) - see ProtectedDomainChip's doc
+        // comment for the other half of this fix (stopping the chip itself from
+        // being what made rows inconsistently tall in the first place).
         Text(text = categoryEmoji(hit.candidate.category), fontSize = 18.sp)
         Spacer(modifier = Modifier.width(10.dp))
         Column(modifier = Modifier.weight(1f)) {
@@ -855,6 +933,8 @@ private fun ProxyRowContent(hit: AliveHit, onAdd: () -> Unit) {
                 fontWeight = FontWeight.Bold,
                 fontSize = 15.sp,
                 color = MaterialTheme.colorScheme.onBackground,
+                maxLines = 1,
+                overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
             )
             Spacer(modifier = Modifier.height(6.dp))
             Row(verticalAlignment = Alignment.CenterVertically) {
@@ -872,7 +952,7 @@ private fun ProxyRowContent(hit: AliveHit, onAdd: () -> Unit) {
             colors = ButtonDefaults.buttonColors(containerColor = TgAccent, contentColor = Color.White),
             contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 14.dp, vertical = 8.dp),
         ) {
-            Text("Добавить", fontSize = 13.sp)
+            Text("Добавить", fontSize = 13.sp, maxLines = 1)
         }
     }
 }
