@@ -11,7 +11,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.material3.Button
 import androidx.compose.material3.Divider
 import androidx.compose.material3.MaterialTheme
@@ -180,6 +180,29 @@ private fun isProtectedDomain(domain: String?): Boolean {
 // https://t.me/..., which Android may route to a browser instead of the app.
 private fun Candidate.toTelegramProxyUrl(): String =
     "tg://proxy?server=$server&port=$port&secret=$secret"
+
+// Root cause of the v0.8.0 crash (confirmed via a real adb logcat capture, not
+// guesswork this time): `IllegalArgumentException: Key "rec-mtproto.yet.ac:443"
+// was already used` inside the results LazyColumn. Two independent gaps let the
+// same physical proxy end up as two AliveHit entries with an identical rendered
+// key:
+//  1. runMassScan's old dedup key was a bare Triple(server, port, secret) - an
+//     exact, case-sensitive string comparison. results.json (server-verified)
+//     and candidates.json (raw) can list the same proxy with the secret hex in
+//     a different case/whitespace form, so distinctBy let both through as
+//     "different" candidates, both got scanned, both came back alive.
+//  2. Separately, the old "⭐ Рекомендуем" LazyColumn key was
+//     "rec-$server:$port" - it never included the secret at all, so even two
+//     *legitimately* distinct proxies (an MTProxy server serving more than one
+//     secret on the same port, which is normal MTProto server behaviour) would
+//     collide there.
+// This helper is now the one place that defines "is this the same proxy" -
+// normalized (trimmed, lowercased) server+port+secret - and is used both to
+// dedup the candidate pool before scanning (so the same proxy is never
+// scanned twice) and to build render keys (so two genuinely different
+// same-server:port proxies never collide either).
+private fun proxyIdentityKey(c: Candidate): String =
+    "${c.server.trim().lowercase()}:${c.port}:${c.secret.trim().lowercase()}"
 
 // downloadKbps/uploadKbps used to be sampled via TDLib's getNetworkStatistics()
 // right after ConnectionStateReady. That was removed in 0.7.1: TDLib's
@@ -509,11 +532,18 @@ fun ProxyCheckScreen(filesDirPath: String) {
 
         Divider(modifier = Modifier.padding(vertical = 12.dp))
 
+        // Belt-and-suspenders dedup (see proxyIdentityKey doc comment): the real
+        // fix is scanning each proxy only once (runMassScan's `key()`), but this
+        // guards the render layer too in case a stale persisted snapshot and a
+        // fresh scan result for the same proxy ever end up coexisting in
+        // aliveResults. Keeps the first occurrence (already-added order).
+        val dedupedAlive = aliveResults.distinctBy { proxyIdentityKey(it.candidate) }
+
         // Sort by a combined "how good is this proxy right now" score everywhere:
         // ascending ping as the base signal, pulled down further by measured
         // speed and by protected-domain status (see recommendScore() doc above).
-        val recommended = aliveResults.sortedBy { it.recommendScore() }.take(8)
-        val grouped: Map<String, List<AliveHit>> = aliveResults
+        val recommended = dedupedAlive.sortedBy { it.recommendScore() }.take(8)
+        val grouped: Map<String, List<AliveHit>> = dedupedAlive
             .groupBy { it.candidate.category }
             .mapValues { (_, hits) -> hits.sortedBy { it.recommendScore() } }
 
@@ -538,7 +568,13 @@ fun ProxyCheckScreen(filesDirPath: String) {
                         modifier = Modifier.fillMaxWidth().padding(top = 4.dp, bottom = 4.dp),
                     )
                 }
-                items(recommended, key = { "rec-${it.candidate.server}:${it.candidate.port}" }) { hit ->
+                // Key includes the full normalized proxy identity (not just
+                // server:port - see proxyIdentityKey doc comment for why that
+                // alone caused the v0.8.0 crash) PLUS the index as an absolute
+                // safety net: even if some future bug ever produced two
+                // AliveHits with a truly identical identity, the index still
+                // guarantees Compose never sees a duplicate key.
+                itemsIndexed(recommended, key = { index, hit -> "rec-$index-${proxyIdentityKey(hit.candidate)}" }) { _, hit ->
                     Text(
                         text = hitLine(hit),
                         textDecoration = TextDecoration.Underline,
@@ -566,7 +602,7 @@ fun ProxyCheckScreen(filesDirPath: String) {
                         modifier = Modifier.fillMaxWidth().padding(top = 12.dp, bottom = 4.dp),
                     )
                 }
-                items(hits, key = { "cat-$category-${it.candidate.server}:${it.candidate.port}" }) { hit ->
+                itemsIndexed(hits, key = { index, hit -> "cat-$category-$index-${proxyIdentityKey(hit.candidate)}" }) { _, hit ->
                     Text(
                         text = hitLine(hit),
                         textDecoration = TextDecoration.Underline,
@@ -600,7 +636,11 @@ private suspend fun runMassScan(
         return
     }
 
-    fun key(c: Candidate) = Triple(c.server, c.port, c.secret)
+    // Normalized identity (see proxyIdentityKey doc comment) - NOT a raw
+    // case-sensitive Triple(server, port, secret) - so the same physical proxy
+    // listed with differently-cased/whitespaced secret hex in results.json vs
+    // candidates.json is recognized as one candidate and scanned only once.
+    fun key(c: Candidate) = proxyIdentityKey(c)
 
     // Protected-domain proxies are rare but survive DPI far better, so test every one
     // we can find (server-verified or not). For the rest: server-verified candidates
