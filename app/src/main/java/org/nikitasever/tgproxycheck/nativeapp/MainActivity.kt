@@ -1,10 +1,14 @@
 package org.nikitasever.tgproxycheck.nativeapp
 
+import android.Manifest
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
@@ -34,8 +38,8 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -49,6 +53,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
 import java.io.File
 import dev.g000sha256.tdl.TdlClient
@@ -275,7 +280,7 @@ data class LastScanSnapshot(val timestampMs: Long, val totalChecked: Int, val hi
 
 // Manual JSON (org.json, already used elsewhere in this file) rather than pulling
 // in a new serialization dependency for one small file.
-private fun saveLastScanResults(filesDirPath: String, totalChecked: Int, hits: List<AliveHit>) {
+internal fun saveLastScanResults(filesDirPath: String, totalChecked: Int, hits: List<AliveHit>) {
     try {
         val root = org.json.JSONObject()
         root.put("timestampMs", System.currentTimeMillis())
@@ -473,7 +478,7 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-private fun formatLastScanTimestamp(timestampMs: Long): String {
+internal fun formatLastScanTimestamp(timestampMs: Long): String {
     val fmt = java.text.SimpleDateFormat("H:mm, d.M.yy", java.util.Locale.getDefault())
     return fmt.format(java.util.Date(timestampMs))
 }
@@ -481,22 +486,34 @@ private fun formatLastScanTimestamp(timestampMs: Long): String {
 @Composable
 fun ProxyCheckScreen(filesDirPath: String) {
     val scope = remember { CoroutineScope(Dispatchers.Main) }
-    val aliveResults = remember { mutableStateListOf<AliveHit>() }
     val context = LocalContext.current
 
     var updateInfo by remember { mutableStateOf<UpdateInfo?>(null) }
     var updateStatus by remember { mutableStateOf<String?>(null) }
     var updateCheckError by remember { mutableStateOf<String?>(null) }
 
-    var lastScanInfo by remember { mutableStateOf<String?>(null) }
-    var totalCheckedLast by remember { mutableStateOf(0) }
-    var everScanned by remember { mutableStateOf(false) }
+    // The scan itself now runs inside ScanService (a foreground Service) so it
+    // - and its status-bar progress notification - survive this Activity going
+    // to the background or being recreated. ScanBridge is the process-wide
+    // StateFlow both this screen and the Service read/write; this screen no
+    // longer owns the scan state directly, it just mirrors the bridge.
+    val uiState by ScanBridge.state.collectAsState()
+    val aliveResults = uiState.aliveResults
+    val lastScanInfo = uiState.lastScanInfo
+    val everScanned = uiState.everScanned
+    val isScanning = uiState.isScanning
+    val scanChecked = uiState.checked
+    val scanTotal = uiState.total
+    val statusLine = uiState.statusLine
 
-    // Progress/status state driving the header progress bar and scan button label.
-    var isScanning by remember { mutableStateOf(false) }
-    var scanChecked by remember { mutableStateOf(0) }
-    var scanTotal by remember { mutableStateOf(0) }
-    var statusLine by remember { mutableStateOf<String?>(null) }
+    // POST_NOTIFICATIONS (Android 13+) is best-effort only: if denied, the scan
+    // still runs exactly the same via ScanService, it just won't be able to
+    // show status-bar progress. No result handling needed beyond letting the
+    // system remember the choice - ScanService's own notify() calls are all
+    // wrapped defensively for exactly this "permission not granted" case.
+    val notificationPermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { /* granted or not, the scan proceeds regardless */ }
 
     LaunchedEffect(Unit) {
         when (val result = checkForUpdate()) {
@@ -508,53 +525,31 @@ fun ProxyCheckScreen(filesDirPath: String) {
         // Load the previous scan's results immediately on cold start, before any
         // new scan runs, so the user isn't staring at an empty screen while a
         // fresh scan (which can take a while over hundreds of candidates) runs.
+        // seedIfEmpty is a no-op if the bridge already holds real state (e.g.
+        // this Activity was merely recreated while ScanService kept running).
         val snapshot = loadLastScanResults(filesDirPath)
         if (snapshot != null) {
-            aliveResults.addAll(snapshot.hits)
-            totalCheckedLast = snapshot.totalChecked
-            everScanned = true
-            lastScanInfo = "Последнее сканирование: ${snapshot.hits.size} из ${snapshot.totalChecked} " +
-                "живы (${formatLastScanTimestamp(snapshot.timestampMs)})"
+            ScanBridge.seedIfEmpty(
+                ScanUiState(
+                    aliveResults = snapshot.hits,
+                    totalCheckedLast = snapshot.totalChecked,
+                    everScanned = true,
+                    lastScanInfo = "Последнее сканирование: ${snapshot.hits.size} из ${snapshot.totalChecked} " +
+                        "живы (${formatLastScanTimestamp(snapshot.timestampMs)})",
+                )
+            )
         }
     }
 
     fun startScan() {
-        aliveResults.clear()
-        lastScanInfo = null
-        isScanning = true
-        everScanned = true
-        scanChecked = 0
-        scanTotal = 0
-        statusLine = "Загружаю список кандидатов..."
-        scope.launch {
-            // Belt-and-suspenders: runMassScan/checkViaConnection now catch
-            // Throwable internally so one bad candidate can't take the whole
-            // scan down, but this outer catch means even a truly unexpected
-            // failure surfaces as a status message instead of crashing the
-            // Activity's UI coroutine scope.
-            try {
-                runMassScan(
-                    filesDirPath,
-                    onStatus = { statusLine = it },
-                    onProgress = { checked, total ->
-                        scanChecked = checked
-                        scanTotal = total
-                    },
-                    onAlive = { aliveResults.add(it) },
-                    onComplete = { totalChecked ->
-                        totalCheckedLast = totalChecked
-                        saveLastScanResults(filesDirPath, totalChecked, aliveResults.toList())
-                        lastScanInfo = "Последнее сканирование: ${aliveResults.size} из $totalChecked " +
-                            "живы (${formatLastScanTimestamp(System.currentTimeMillis())})"
-                    },
-                )
-            } catch (e: Throwable) {
-                android.util.Log.e(SCAN_TAG, "runMassScan crashed: ${e::class.simpleName}: ${e.message}", e)
-                statusLine = "FAIL: сканирование прервано — ${e::class.simpleName}: ${e.message}"
-            } finally {
-                isScanning = false
-            }
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU &&
+            ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) !=
+                PackageManager.PERMISSION_GRANTED
+        ) {
+            notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
         }
+        val intent = Intent(context, ScanService::class.java).setAction(ACTION_START_SCAN)
+        ContextCompat.startForegroundService(context, intent)
     }
 
     Column(
@@ -933,7 +928,7 @@ private fun RecommendedPanel(recommended: List<AliveHit>, onAdd: (AliveHit) -> U
     }
 }
 
-private suspend fun runMassScan(
+internal suspend fun runMassScan(
     filesDirPath: String,
     onStatus: (String) -> Unit,
     onProgress: (checked: Int, total: Int) -> Unit,
