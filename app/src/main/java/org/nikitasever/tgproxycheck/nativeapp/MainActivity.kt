@@ -773,7 +773,22 @@ fun ProxyCheckScreen(filesDirPath: String) {
         // Sort by a combined "how good is this proxy right now" score everywhere:
         // ascending ping as the base signal, pulled down further by measured
         // speed and by protected-domain status (see recommendScore() doc above).
-        val recommended = dedupedAlive.sortedBy { it.recommendScore() }.take(8)
+        //
+        // Host-diversity cap for Рекомендуем: a single MTProto server can (and in
+        // practice does, e.g. mtproto.yet.ac) legitimately serve many distinct
+        // secrets on the same server:port - proxyIdentityKey correctly treats
+        // each secret as its own AliveHit, so dedupedAlive can contain 8+ entries
+        // that are all "the same host" from the user's point of view. Left alone,
+        // sortedBy{recommendScore()}.take(8) can fill the entire "recommended"
+        // panel with near-identical entries from one prolific host, which reads
+        // as a bug ("why are there 8 copies of the same proxy?") even though it
+        // isn't one. Fix: collapse to the single best-scoring hit per
+        // server:port BEFORE taking the top N, so Рекомендуем is diverse across
+        // hosts. Keeps the same recommendScore() ordering/logic otherwise.
+        val bestPerHost: List<AliveHit> = dedupedAlive
+            .groupBy { "${it.candidate.server.trim().lowercase()}:${it.candidate.port}" }
+            .map { (_, hits) -> hits.minBy { it.recommendScore() } }
+        val recommended = bestPerHost.sortedBy { it.recommendScore() }.take(8)
         val grouped: Map<String, List<AliveHit>> = dedupedAlive
             .groupBy { it.candidate.category }
             .mapValues { (_, hits) -> hits.sortedBy { it.recommendScore() } }
