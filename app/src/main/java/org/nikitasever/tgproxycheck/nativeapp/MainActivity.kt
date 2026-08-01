@@ -1,10 +1,14 @@
 package org.nikitasever.tgproxycheck.nativeapp
 
 import android.Manifest
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Bundle
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -23,6 +27,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -34,6 +39,8 @@ import androidx.compose.material3.Divider
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Tab
+import androidx.compose.material3.TabRow
 import androidx.compose.material3.Text
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
@@ -90,6 +97,18 @@ private const val RESULTS_URL =
     "https://77.110.98.222:8765/results.json?token=M2Pxr2BUvkbrS-9CSu40D2CFwwgY0rxY"
 private const val CANDIDATES_URL =
     "https://77.110.98.222:8765/candidates.json?token=M2Pxr2BUvkbrS-9CSu40D2CFwwgY0rxY"
+
+// Separate, lightweight server-side pipeline (xray_main.py/xray_sources.py on
+// the VPS) that collects public VLESS/VMess/VLESS+Reality configs for
+// general-purpose Xray-core clients (v2rayNG etc.) - a completely different
+// protocol family from MTProto, unrelated to Telegram proxying. It does only
+// a bare TCP-connect check server-side (no deep protocol verification, kept
+// cheap on purpose), so xray.json already IS the "alive" list - unlike
+// results.json/candidates.json above there's no separate raw-vs-verified
+// split to reconcile client-side. Same host/port/token-auth pattern as the
+// existing endpoints (served by the same results_server.py process).
+private const val XRAY_URL =
+    "https://77.110.98.222:8765/xray.json?token=M2Pxr2BUvkbrS-9CSu40D2CFwwgY0rxY"
 
 // Proxies masquerading (via FakeTLS) as one of these can't be blocked wholesale by an
 // ISP without breaking huge amounts of legitimate traffic, so they survive targeted DPI
@@ -631,8 +650,41 @@ class MainActivity : ComponentActivity() {
         setContent {
             MaterialTheme(colorScheme = TgColorScheme) {
                 Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
-                    ProxyCheckScreen(filesDir.absolutePath)
+                    RootScreen(filesDir.absolutePath)
                 }
+            }
+        }
+    }
+}
+
+// Minimal-footprint top-level nav: the app was single-screen until the
+// VLESS/VMess/Reality feature (server-side xray_main.py pipeline) needed a
+// second, unrelated dataset with its own UI. A two-tab switcher above the
+// existing content is the smallest change that fits both without reworking
+// the (still single-purpose) ProxyCheckScreen/XrayScreen internals.
+@Composable
+private fun RootScreen(filesDirPath: String) {
+    var selectedTab by remember { mutableStateOf(0) }
+    val tabTitles = listOf("MTProto", "VLESS / VPN")
+
+    Column(modifier = Modifier.fillMaxSize()) {
+        TabRow(
+            selectedTabIndex = selectedTab,
+            containerColor = TgSurface,
+            contentColor = TgAccent,
+        ) {
+            tabTitles.forEachIndexed { index, title ->
+                Tab(
+                    selected = selectedTab == index,
+                    onClick = { selectedTab = index },
+                    text = { Text(title, fontSize = 13.sp) },
+                )
+            }
+        }
+        Box(modifier = Modifier.fillMaxSize()) {
+            when (selectedTab) {
+                0 -> ProxyCheckScreen(filesDirPath)
+                else -> XrayScreen()
             }
         }
     }
@@ -1149,6 +1201,206 @@ private fun RecommendedPanel(recommended: List<AliveHit>, onAdd: (AliveHit) -> U
     }
 }
 
+// Outcome of the one-shot xray.json fetch - mirrors UpdateCheckResult's
+// pattern of distinct named states rather than a bare nullable, for the same
+// reason: "still loading" and "failed" must not collapse into one ambiguous
+// UI state.
+private sealed class XrayFetchState {
+    object Loading : XrayFetchState()
+    data class Loaded(val configs: List<XrayConfig>) : XrayFetchState()
+    data class Error(val message: String) : XrayFetchState()
+}
+
+// This tab is intentionally "fetch and display the server's already-checked
+// list" only - the server-side pipeline (xray_main.py) already did the
+// TCP-alive check, there's no on-device xray-core here and no new scanning
+// logic, unlike the much heavier MTProto mass-scan on the other tab.
+@Composable
+private fun XrayScreen() {
+    val context = LocalContext.current
+    var state by remember { mutableStateOf<XrayFetchState>(XrayFetchState.Loading) }
+
+    suspend fun load() {
+        state = XrayFetchState.Loading
+        state = try {
+            XrayFetchState.Loaded(fetchXrayConfigs())
+        } catch (e: Exception) {
+            XrayFetchState.Error("${e::class.simpleName}: ${e.message}")
+        }
+    }
+
+    LaunchedEffect(Unit) { load() }
+
+    fun copyLink(config: XrayConfig) {
+        val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        clipboard.setPrimaryClip(ClipData.newPlainText("proxy link", config.raw))
+        Toast.makeText(context, "Ссылка скопирована", Toast.LENGTH_SHORT).show()
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(MaterialTheme.colorScheme.background)
+            .padding(20.dp)
+    ) {
+        when (val s = state) {
+            is XrayFetchState.Loading -> {
+                Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        CircularProgressIndicator(color = TgAccent)
+                        Spacer(modifier = Modifier.height(12.dp))
+                        Text("Загружаю список...", color = TgOnSurfaceMuted, fontSize = 13.sp)
+                    }
+                }
+            }
+            is XrayFetchState.Error -> {
+                Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        Text(
+                            text = "Не удалось загрузить список: ${s.message}",
+                            color = TgError,
+                            fontSize = 13.sp,
+                            textAlign = TextAlign.Center,
+                            modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+                        )
+                        val scope = remember { CoroutineScope(Dispatchers.Main) }
+                        Button(
+                            shape = RoundedCornerShape(10.dp),
+                            colors = ButtonDefaults.buttonColors(containerColor = TgAccent, contentColor = Color.White),
+                            onClick = { scope.launch { load() } },
+                        ) {
+                            Text("Повторить")
+                        }
+                    }
+                }
+            }
+            is XrayFetchState.Loaded -> {
+                if (s.configs.isEmpty()) {
+                    Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                        Text(
+                            text = "Список пуст. Попробуйте позже.",
+                            color = TgOnSurfaceMuted,
+                            textAlign = TextAlign.Center,
+                        )
+                    }
+                } else {
+                    val realityCount = s.configs.count { it.reality }
+                    Text(
+                        text = "VLESS / VMess (${s.configs.size}), из них Reality: $realityCount",
+                        color = TgOnSurfaceMuted,
+                        fontSize = 13.sp,
+                        modifier = Modifier.padding(bottom = 12.dp),
+                    )
+                    LazyColumn(modifier = Modifier.fillMaxSize()) {
+                        items(s.configs, key = { "${it.protocol}:${it.host}:${it.port}:${it.raw.hashCode()}" }) { config ->
+                            XrayConfigCard(
+                                config = config,
+                                onCopy = { copyLink(config) },
+                                modifier = Modifier.padding(bottom = 10.dp),
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ProtocolBadge(protocol: String) {
+    Surface(
+        color = TgAccentDark.copy(alpha = 0.20f),
+        shape = RoundedCornerShape(8.dp),
+    ) {
+        Text(
+            text = protocol.uppercase(),
+            color = TgAccentDark,
+            fontSize = 11.sp,
+            fontWeight = FontWeight.Bold,
+            modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp),
+        )
+    }
+}
+
+// Reality's DPI-resistance signal for this protocol family - the closest
+// analogue to MTProto's "защищённый домен" (ProtectedDomainChip): a
+// VLESS+Reality config mimics a real TLS 1.3 handshake against a genuine
+// third-party site, so it can't be blocked wholesale by an ISP without also
+// breaking that legitimate traffic. Same visual language (accent-tinted
+// pill, single line, ellipsized) as ProtectedDomainChip on purpose.
+@Composable
+private fun RealityChip() {
+    Surface(
+        color = TgAccent.copy(alpha = 0.16f),
+        shape = RoundedCornerShape(8.dp),
+    ) {
+        Text(
+            text = "🛡 Reality",
+            color = TgAccent,
+            fontSize = 10.sp,
+            maxLines = 1,
+            softWrap = false,
+            overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+            modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp),
+        )
+    }
+}
+
+@Composable
+private fun XrayConfigCard(config: XrayConfig, onCopy: () -> Unit, modifier: Modifier = Modifier) {
+    Card(
+        modifier = modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(14.dp),
+        colors = CardDefaults.cardColors(containerColor = TgSurface),
+        elevation = CardDefaults.cardElevation(defaultElevation = 1.dp),
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(vertical = 12.dp, horizontal = 14.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = "${config.host}:${config.port}",
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 15.sp,
+                    color = MaterialTheme.colorScheme.onBackground,
+                    maxLines = 1,
+                    overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                )
+                Spacer(modifier = Modifier.height(6.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    ProtocolBadge(config.protocol)
+                    Spacer(modifier = Modifier.width(6.dp))
+                    PingBadge(config.latencyMs.toLong())
+                    if (config.reality) {
+                        Spacer(modifier = Modifier.width(6.dp))
+                        RealityChip()
+                    }
+                }
+                if (!config.sni.isNullOrEmpty()) {
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                        text = "sni: ${config.sni}",
+                        color = TgOnSurfaceMuted,
+                        fontSize = 11.sp,
+                        maxLines = 1,
+                        overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                    )
+                }
+            }
+            Spacer(modifier = Modifier.width(12.dp))
+            Button(
+                onClick = onCopy,
+                shape = RoundedCornerShape(10.dp),
+                colors = ButtonDefaults.buttonColors(containerColor = TgAccent, contentColor = Color.White),
+                contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 14.dp, vertical = 8.dp),
+            ) {
+                Text("Копировать", fontSize = 13.sp, maxLines = 1)
+            }
+        }
+    }
+}
+
 internal suspend fun runMassScan(
     filesDirPath: String,
     onStatus: (String) -> Unit,
@@ -1515,22 +1767,32 @@ private suspend fun checkOneCandidate(
     )
 }
 
+// Self-signed cert on the VPS's own HTTPS endpoint (same one results_server.py
+// uses for /results.json, /candidates.json and /xray.json) - trust-all is
+// deliberate here, not an oversight: this connects to a single known IP the
+// app author controls, the same trust model the Python checker already uses
+// server-side for its own requests. Shared by every fetch* function below
+// instead of each building its own SSLContext.
+private fun trustAllHttpsConnection(url: String): HttpsURLConnection {
+    val trustAll = arrayOf<javax.net.ssl.TrustManager>(object : X509TrustManager {
+        override fun checkClientTrusted(chain: Array<out X509Certificate>?, authType: String?) = Unit
+        override fun checkServerTrusted(chain: Array<out X509Certificate>?, authType: String?) = Unit
+        override fun getAcceptedIssuers(): Array<X509Certificate> = arrayOf()
+    })
+    val sslContext = SSLContext.getInstance("TLS")
+    sslContext.init(null, trustAll, SecureRandom())
+
+    val connection = java.net.URL(url).openConnection() as HttpsURLConnection
+    connection.sslSocketFactory = sslContext.socketFactory
+    connection.hostnameVerifier = javax.net.ssl.HostnameVerifier { _, _ -> true }
+    connection.connectTimeout = 15_000
+    connection.readTimeout = 15_000
+    return connection
+}
+
 private suspend fun fetchJsonCandidates(url: String, jsonArrayKey: String): List<Candidate> =
     withContext(Dispatchers.IO) {
-        val trustAll = arrayOf<javax.net.ssl.TrustManager>(object : X509TrustManager {
-            override fun checkClientTrusted(chain: Array<out X509Certificate>?, authType: String?) = Unit
-            override fun checkServerTrusted(chain: Array<out X509Certificate>?, authType: String?) = Unit
-            override fun getAcceptedIssuers(): Array<X509Certificate> = arrayOf()
-        })
-        val sslContext = SSLContext.getInstance("TLS")
-        sslContext.init(null, trustAll, SecureRandom())
-
-        val connection = java.net.URL(url).openConnection() as HttpsURLConnection
-        connection.sslSocketFactory = sslContext.socketFactory
-        connection.hostnameVerifier = javax.net.ssl.HostnameVerifier { _, _ -> true }
-        connection.connectTimeout = 15_000
-        connection.readTimeout = 15_000
-
+        val connection = trustAllHttpsConnection(url)
         val body = connection.inputStream.bufferedReader().use { it.readText() }
         val root = org.json.JSONObject(body)
         val itemsJson: JSONArray = if (root.has(jsonArrayKey)) root.getJSONArray(jsonArrayKey) else JSONArray(body)
@@ -1549,3 +1811,40 @@ private suspend fun fetchJsonCandidates(url: String, jsonArrayKey: String): List
             )
         }
     }
+
+// One entry from xray.json - a server-verified-TCP-alive VLESS/VMess/Reality
+// config. `raw` is the exact vless://... / vmess://... share-link as produced
+// server-side (xray_sources.py) - this is what gets copied to the clipboard,
+// since there's no universal deep-link scheme for this protocol family (unlike
+// Telegram's tg://proxy) and v2rayNG/NekoBox/etc. all import via that raw link
+// pasted from the clipboard.
+data class XrayConfig(
+    val protocol: String,
+    val host: String,
+    val port: Int,
+    val latencyMs: Int,
+    val reality: Boolean,
+    val sni: String?,
+    val tag: String?,
+    val raw: String,
+)
+
+private suspend fun fetchXrayConfigs(): List<XrayConfig> = withContext(Dispatchers.IO) {
+    val connection = trustAllHttpsConnection(XRAY_URL)
+    val body = connection.inputStream.bufferedReader().use { it.readText() }
+    val root = org.json.JSONObject(body)
+    val itemsJson = root.getJSONArray("configs")
+    (0 until itemsJson.length()).map { i ->
+        val o = itemsJson.getJSONObject(i)
+        XrayConfig(
+            protocol = o.getString("protocol"),
+            host = o.getString("host"),
+            port = o.getInt("port"),
+            latencyMs = o.optInt("latency_ms", 0),
+            reality = o.optBoolean("reality", false),
+            sni = if (o.has("sni") && !o.isNull("sni")) o.getString("sni") else null,
+            tag = if (o.has("tag") && !o.isNull("tag")) o.getString("tag") else null,
+            raw = o.getString("raw"),
+        )
+    }
+}
