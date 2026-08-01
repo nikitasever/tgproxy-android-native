@@ -397,14 +397,34 @@ internal fun isVersionNewer(remote: String, local: String): Boolean {
     return rPatch > lPatch
 }
 
-private suspend fun checkForUpdate(): UpdateCheckResult = withContext(Dispatchers.IO) {
+// Outcome of an actual network attempt: `notModified = true` means the server
+// returned 304 (our cached ETag is still current) and `result` should be
+// ignored in favor of whatever the caller already had cached - there is no
+// new data to act on, only confirmation the old data still holds.
+data class UpdateCheckAttempt(val result: UpdateCheckResult, val etag: String?, val notModified: Boolean)
+
+// `ifNoneMatch` lets the caller send a previously-seen ETag (see
+// UpdateCheckCache below) so an unchanged latest-release gets a cheap 304
+// instead of a full body - still counts against the GitHub rate limit the
+// same as any other request, per GitHub's docs, but avoids re-parsing/re-
+// deciding anything when nothing changed. This is a minor politeness
+// improvement layered on top of the real fix, which is the caller-side
+// interval gate in loadOrRefreshUpdateCheck that avoids making this call at
+// all on most launches.
+private suspend fun checkForUpdate(ifNoneMatch: String? = null): UpdateCheckAttempt = withContext(Dispatchers.IO) {
     try {
         val connection = java.net.URL(GITHUB_LATEST_RELEASE_URL).openConnection() as HttpsURLConnection
         connection.setRequestProperty("Accept", "application/vnd.github+json")
+        if (ifNoneMatch != null) {
+            connection.setRequestProperty("If-None-Match", ifNoneMatch)
+        }
         connection.connectTimeout = 10_000
         connection.readTimeout = 10_000
 
         val responseCode = connection.responseCode
+        if (responseCode == 304) {
+            return@withContext UpdateCheckAttempt(UpdateCheckResult.UpToDate, ifNoneMatch, notModified = true)
+        }
         if (responseCode !in 200..299) {
             val errorBody = try {
                 connection.errorStream?.bufferedReader()?.use { it.readText() }
@@ -413,14 +433,15 @@ private suspend fun checkForUpdate(): UpdateCheckResult = withContext(Dispatcher
             }
             val message = "HTTP $responseCode${errorBody?.let { " — $it" } ?: ""}"
             android.util.Log.e(UPDATE_CHECK_TAG, "checkForUpdate failed: $message")
-            return@withContext UpdateCheckResult.Error(message)
+            return@withContext UpdateCheckAttempt(UpdateCheckResult.Error(message), null, notModified = false)
         }
 
+        val etag = connection.getHeaderField("ETag")
         val body = connection.inputStream.bufferedReader().use { it.readText() }
         val root = org.json.JSONObject(body)
         val tagName = root.getString("tag_name").removePrefix("v")
         if (!isVersionNewer(remote = tagName, local = BuildConfig.VERSION_NAME)) {
-            return@withContext UpdateCheckResult.UpToDate
+            return@withContext UpdateCheckAttempt(UpdateCheckResult.UpToDate, etag, notModified = false)
         }
 
         val assets = root.getJSONArray("assets")
@@ -435,14 +456,119 @@ private suspend fun checkForUpdate(): UpdateCheckResult = withContext(Dispatcher
         if (downloadUrl == null) {
             val message = "release $tagName has no app-debug.apk asset"
             android.util.Log.e(UPDATE_CHECK_TAG, "checkForUpdate failed: $message")
-            return@withContext UpdateCheckResult.Error(message)
+            return@withContext UpdateCheckAttempt(UpdateCheckResult.Error(message), etag, notModified = false)
         }
-        UpdateCheckResult.Available(UpdateInfo(version = tagName, downloadUrl = downloadUrl))
+        UpdateCheckAttempt(
+            UpdateCheckResult.Available(UpdateInfo(version = tagName, downloadUrl = downloadUrl)),
+            etag,
+            notModified = false,
+        )
     } catch (e: Exception) {
         val message = "${e::class.simpleName}: ${e.message}"
         android.util.Log.e(UPDATE_CHECK_TAG, "checkForUpdate failed: $message", e)
-        UpdateCheckResult.Error(message)
+        UpdateCheckAttempt(UpdateCheckResult.Error(message), null, notModified = false)
     }
+}
+
+private const val UPDATE_CHECK_CACHE_FILE_NAME = "update_check_cache.json"
+
+// 6h: long enough that even someone force-closing/reopening the app
+// repeatedly, or several devices behind the same NAT/office IP, won't burn
+// through GitHub's 60-req/hour unauthenticated quota - this isn't
+// time-critical, the goal is just to notice updates eventually. Applied
+// uniformly to both successful and failed attempts (see
+// loadOrRefreshUpdateCheck) so a rate-limited attempt backs off exactly the
+// same as a successful one, instead of hammering GitHub again on the very
+// next cold start.
+private const val UPDATE_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000L
+
+private data class UpdateCheckCache(
+    val timestampMs: Long,
+    val outcome: String, // "available" | "uptodate" | "error"
+    val version: String?,
+    val downloadUrl: String?,
+    val errorMessage: String?,
+    val etag: String?,
+) {
+    fun toResult(): UpdateCheckResult = when (outcome) {
+        "available" -> UpdateCheckResult.Available(UpdateInfo(version = version ?: "", downloadUrl = downloadUrl ?: ""))
+        "error" -> UpdateCheckResult.Error(errorMessage ?: "unknown error")
+        else -> UpdateCheckResult.UpToDate
+    }
+}
+
+// Same manual-JSON-with-org.json, write-to-tmp-then-rename pattern as
+// saveLastScanResults/loadLastScanResults above, for consistency and to
+// avoid pulling in DataStore/Room for one small cached file.
+private fun saveUpdateCheckCache(filesDirPath: String, result: UpdateCheckResult, etag: String?) {
+    try {
+        val root = org.json.JSONObject()
+        root.put("timestampMs", System.currentTimeMillis())
+        when (result) {
+            is UpdateCheckResult.Available -> {
+                root.put("outcome", "available")
+                root.put("version", result.info.version)
+                root.put("downloadUrl", result.info.downloadUrl)
+            }
+            UpdateCheckResult.UpToDate -> root.put("outcome", "uptodate")
+            is UpdateCheckResult.Error -> {
+                root.put("outcome", "error")
+                root.put("errorMessage", result.message)
+            }
+        }
+        if (etag != null) root.put("etag", etag)
+        val target = File(filesDirPath, UPDATE_CHECK_CACHE_FILE_NAME)
+        val tmp = File(filesDirPath, "$UPDATE_CHECK_CACHE_FILE_NAME.tmp")
+        tmp.writeText(root.toString())
+        if (!tmp.renameTo(target)) {
+            target.writeText(root.toString())
+            tmp.delete()
+        }
+    } catch (e: Throwable) {
+        android.util.Log.e(UPDATE_CHECK_TAG, "saveUpdateCheckCache failed: ${e.message}", e)
+    }
+}
+
+private fun loadUpdateCheckCache(filesDirPath: String): UpdateCheckCache? {
+    return try {
+        val file = File(filesDirPath, UPDATE_CHECK_CACHE_FILE_NAME)
+        if (!file.exists()) return null
+        val root = org.json.JSONObject(file.readText())
+        UpdateCheckCache(
+            timestampMs = root.getLong("timestampMs"),
+            outcome = root.getString("outcome"),
+            version = if (root.has("version")) root.getString("version") else null,
+            downloadUrl = if (root.has("downloadUrl")) root.getString("downloadUrl") else null,
+            errorMessage = if (root.has("errorMessage")) root.getString("errorMessage") else null,
+            etag = if (root.has("etag")) root.getString("etag") else null,
+        )
+    } catch (e: Throwable) {
+        android.util.Log.e(UPDATE_CHECK_TAG, "loadUpdateCheckCache failed: ${e.message}", e)
+        null
+    }
+}
+
+// Automatic background check invoked from ProxyCheckScreen's cold-start
+// LaunchedEffect - NOT used by the manual "Обновить" button, which downloads
+// the already-known updateInfo directly and has nothing to do with this
+// interval gate. If the cache is fresh (within UPDATE_CHECK_INTERVAL_MS of
+// the last attempt, success or failure alike), reuse it with no network call
+// at all; this is what actually prevents hitting GitHub's rate limit on
+// repeated launches. Only once the cache is stale (or absent) do we make a
+// real request, and whatever happens - success, UpToDate, or an error such
+// as a 403 rate-limit response - gets written back with a fresh timestamp so
+// the next launch within the window also skips the network.
+private suspend fun loadOrRefreshUpdateCheck(filesDirPath: String): UpdateCheckResult {
+    val cache = loadUpdateCheckCache(filesDirPath)
+    val now = System.currentTimeMillis()
+    if (cache != null && now - cache.timestampMs < UPDATE_CHECK_INTERVAL_MS) {
+        return cache.toResult()
+    }
+    val attempt = checkForUpdate(cache?.etag)
+    val result = if (attempt.notModified && cache != null) cache.toResult() else attempt.result
+    val etagToStore = if (attempt.notModified) cache?.etag else attempt.etag
+    saveUpdateCheckCache(filesDirPath, result, etagToStore)
+    return result
 }
 
 // Overall wall-clock cap on the download step, separate from the per-socket-op
@@ -563,7 +689,7 @@ fun ProxyCheckScreen(filesDirPath: String) {
     ) { updateStatus = null }
 
     LaunchedEffect(Unit) {
-        when (val result = checkForUpdate()) {
+        when (val result = loadOrRefreshUpdateCheck(filesDirPath)) {
             is UpdateCheckResult.Available -> updateInfo = result.info
             UpdateCheckResult.UpToDate -> Unit
             is UpdateCheckResult.Error -> updateCheckError = result.message
