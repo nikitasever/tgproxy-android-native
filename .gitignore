@@ -6,3 +6,5 @@ app/build/
 .idea/
 .kotlin/
 keystore/
+gradle-9.0.0/
+gradle-9.0-bin.zip

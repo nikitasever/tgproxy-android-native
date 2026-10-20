@@ -94,9 +94,9 @@ import javax.net.ssl.X509TrustManager
 // The server's own endpoints (self-signed cert, same trust-all approach the
 // Python checker already uses server-side for its own requests).
 private const val RESULTS_URL =
-    "https://77.110.98.222:8765/results.json?token=M2Pxr2BUvkbrS-9CSu40D2CFwwgY0rxY"
+    "https://185.221.196.212:8765/results.json?token=M2Pxr2BUvkbrS-9CSu40D2CFwwgY0rxY"
 private const val CANDIDATES_URL =
-    "https://77.110.98.222:8765/candidates.json?token=M2Pxr2BUvkbrS-9CSu40D2CFwwgY0rxY"
+    "https://185.221.196.212:8765/candidates.json?token=M2Pxr2BUvkbrS-9CSu40D2CFwwgY0rxY"
 
 // Separate, lightweight server-side pipeline (xray_main.py/xray_sources.py on
 // the VPS) that collects public VLESS/VMess/VLESS+Reality configs for
@@ -108,7 +108,7 @@ private const val CANDIDATES_URL =
 // split to reconcile client-side. Same host/port/token-auth pattern as the
 // existing endpoints (served by the same results_server.py process).
 private const val XRAY_URL =
-    "https://77.110.98.222:8765/xray.json?token=M2Pxr2BUvkbrS-9CSu40D2CFwwgY0rxY"
+    "https://185.221.196.212:8765/xray.json?token=M2Pxr2BUvkbrS-9CSu40D2CFwwgY0rxY"
 
 // Proxies masquerading (via FakeTLS) as one of these can't be blocked wholesale by an
 // ISP without breaking huge amounts of legitimate traffic, so they survive targeted DPI
