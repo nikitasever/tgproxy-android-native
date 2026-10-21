@@ -60,6 +60,23 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.pager.HorizontalPager
+import androidx.compose.foundation.pager.rememberPagerState
+import androidx.compose.material3.Badge
+import androidx.compose.material3.BadgedBox
+import androidx.compose.material3.Icon
+import androidx.compose.material3.NavigationBar
+import androidx.compose.material3.NavigationBarItem
+import androidx.compose.material3.NavigationBarItemDefaults
+import androidx.compose.material3.Scaffold
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.graphics.vector.path
 import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
 import java.io.File
@@ -644,6 +661,42 @@ private fun pingColor(pingMs: Long): Color = when {
     else -> Color(0xFFF44336)
 }
 
+private val TelegramPlaneIcon: ImageVector by lazy {
+    ImageVector.Builder(
+        name = "TelegramPlane",
+        defaultWidth = 24.dp,
+        defaultHeight = 24.dp,
+        viewportWidth = 24f,
+        viewportHeight = 24f,
+    ).path(fill = SolidColor(Color.White)) {
+        moveTo(2.01f, 21f)
+        lineTo(23f, 12f)
+        lineTo(2.01f, 3f)
+        lineTo(2f, 10f)
+        lineTo(17f, 12f)
+        lineTo(2f, 14f)
+        close()
+    }.build()
+}
+
+private val VpnShieldIcon: ImageVector by lazy {
+    ImageVector.Builder(
+        name = "VpnShield",
+        defaultWidth = 24.dp,
+        defaultHeight = 24.dp,
+        viewportWidth = 24f,
+        viewportHeight = 24f,
+    ).path(fill = SolidColor(Color.White)) {
+        moveTo(12f, 2f)
+        lineTo(4f, 5f)
+        verticalLineTo(11.09f)
+        curveTo(4f, 16.14f, 7.41f, 20.85f, 12f, 22f)
+        curveTo(16.59f, 20.85f, 20f, 16.14f, 20f, 11.09f)
+        verticalLineTo(5f)
+        close()
+    }.build()
+}
+
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -657,32 +710,100 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-// Minimal-footprint top-level nav: the app was single-screen until the
-// VLESS/VMess/Reality feature (server-side xray_main.py pipeline) needed a
-// second, unrelated dataset with its own UI. A two-tab switcher above the
-// existing content is the smallest change that fits both without reworking
-// the (still single-purpose) ProxyCheckScreen/XrayScreen internals.
+// Bottom navigation bar + horizontal swipe pager: thumb-friendly navigation
+// between MTProto and VLESS/VPN, safe insets to prevent status bar clipping,
+// and live badge counting for discovered proxies.
 @Composable
 private fun RootScreen(filesDirPath: String) {
-    var selectedTab by remember { mutableStateOf(0) }
-    val tabTitles = listOf("MTProto", "VLESS / VPN")
+    val pagerState = rememberPagerState(pageCount = { 2 })
+    val scope = rememberCoroutineScope()
 
-    Column(modifier = Modifier.fillMaxSize()) {
-        TabRow(
-            selectedTabIndex = selectedTab,
-            containerColor = TgSurface,
-            contentColor = TgAccent,
-        ) {
-            tabTitles.forEachIndexed { index, title ->
-                Tab(
-                    selected = selectedTab == index,
-                    onClick = { selectedTab = index },
-                    text = { Text(title, fontSize = 13.sp) },
+    val scanUiState by ScanBridge.state.collectAsState()
+    val mtprotoBadgeCount = scanUiState.aliveResults.distinctBy { proxyIdentityKey(it.candidate) }.size
+
+    Scaffold(
+        modifier = Modifier
+            .fillMaxSize()
+            .statusBarsPadding(),
+        bottomBar = {
+            NavigationBar(
+                containerColor = TgSurface,
+                contentColor = TgAccent,
+                tonalElevation = 8.dp,
+                modifier = Modifier.navigationBarsPadding(),
+            ) {
+                NavigationBarItem(
+                    selected = pagerState.currentPage == 0,
+                    onClick = { scope.launch { pagerState.animateScrollToPage(0) } },
+                    icon = {
+                        BadgedBox(badge = {
+                            if (mtprotoBadgeCount > 0) {
+                                Badge(
+                                    containerColor = TgAccent,
+                                    contentColor = Color.White,
+                                ) {
+                                    Text(mtprotoBadgeCount.toString())
+                                }
+                            }
+                        }) {
+                            Icon(
+                                imageVector = TelegramPlaneIcon,
+                                contentDescription = "MTProto",
+                                modifier = Modifier.size(24.dp),
+                            )
+                        }
+                    },
+                    label = {
+                        Text(
+                            "MTProto",
+                            fontSize = 12.sp,
+                            fontWeight = if (pagerState.currentPage == 0) FontWeight.Bold else FontWeight.Normal,
+                        )
+                    },
+                    colors = NavigationBarItemDefaults.colors(
+                        selectedIconColor = TgAccent,
+                        selectedTextColor = TgAccent,
+                        indicatorColor = TgSurfaceVariant,
+                        unselectedIconColor = TgOnSurfaceMuted,
+                        unselectedTextColor = TgOnSurfaceMuted,
+                    ),
+                )
+                NavigationBarItem(
+                    selected = pagerState.currentPage == 1,
+                    onClick = { scope.launch { pagerState.animateScrollToPage(1) } },
+                    icon = {
+                        Icon(
+                            imageVector = VpnShieldIcon,
+                            contentDescription = "VLESS / VPN",
+                            modifier = Modifier.size(24.dp),
+                        )
+                    },
+                    label = {
+                        Text(
+                            "VLESS / VPN",
+                            fontSize = 12.sp,
+                            fontWeight = if (pagerState.currentPage == 1) FontWeight.Bold else FontWeight.Normal,
+                        )
+                    },
+                    colors = NavigationBarItemDefaults.colors(
+                        selectedIconColor = TgAccent,
+                        selectedTextColor = TgAccent,
+                        indicatorColor = TgSurfaceVariant,
+                        unselectedIconColor = TgOnSurfaceMuted,
+                        unselectedTextColor = TgOnSurfaceMuted,
+                    ),
                 )
             }
-        }
-        Box(modifier = Modifier.fillMaxSize()) {
-            when (selectedTab) {
+        },
+        containerColor = TgBackground,
+    ) { innerPadding ->
+        HorizontalPager(
+            state = pagerState,
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(innerPadding),
+        ) { page ->
+            when (page) {
                 0 -> ProxyCheckScreen(filesDirPath)
                 else -> XrayScreen()
             }
@@ -803,64 +924,82 @@ fun ProxyCheckScreen(filesDirPath: String) {
                         color = MaterialTheme.colorScheme.onBackground,
                         fontWeight = FontWeight.SemiBold,
                     )
-                    updateStatus?.let {
-                        Text(text = it, color = TgOnSurfaceMuted, fontSize = 12.sp, modifier = Modifier.padding(top = 2.dp))
+                    updateStatus?.let { status ->
+                        Text(
+                            text = status,
+                            color = if (status.startsWith("FAIL")) TgError else TgOnSurfaceMuted,
+                            fontSize = 12.sp,
+                            modifier = Modifier.padding(top = 2.dp),
+                        )
+                        if (status == "скачиваю...") {
+                            Spacer(modifier = Modifier.height(8.dp))
+                            LinearProgressIndicator(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(4.dp)
+                                    .clip(RoundedCornerShape(2.dp)),
+                                color = TgAccent,
+                                trackColor = TgSurface,
+                            )
+                        }
                     }
-                    Button(
-                        modifier = Modifier.fillMaxWidth().padding(top = 10.dp),
-                        shape = RoundedCornerShape(10.dp),
-                        colors = ButtonDefaults.buttonColors(containerColor = TgAccent, contentColor = Color.White),
-                        onClick = {
-                            val needsInstallPermission = android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O &&
-                                !context.packageManager.canRequestPackageInstalls()
-                            if (needsInstallPermission) {
-                                updateStatus = "нужно разрешение на установку — открываю настройки"
-                                context.startActivity(
-                                    Intent(
-                                        android.provider.Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
-                                        Uri.parse("package:${context.packageName}"),
+                    if (updateStatus != "скачиваю..." && updateStatus != "устанавливаю...") {
+                        Button(
+                            modifier = Modifier.fillMaxWidth().padding(top = 10.dp),
+                            shape = RoundedCornerShape(10.dp),
+                            colors = ButtonDefaults.buttonColors(containerColor = TgAccent, contentColor = Color.White),
+                            onClick = {
+                                val needsInstallPermission = android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O &&
+                                    !context.packageManager.canRequestPackageInstalls()
+                                if (needsInstallPermission) {
+                                    updateStatus = "нужно разрешение на установку — открываю настройки"
+                                    context.startActivity(
+                                        Intent(
+                                            android.provider.Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                                            Uri.parse("package:${context.packageName}"),
+                                        )
                                     )
-                                )
-                                return@Button
-                            }
-                            scope.launch {
-                                updateStatus = "скачиваю..."
-                                try {
-                                    val updatesDir = File(context.cacheDir, "updates").apply { mkdirs() }
-                                    val apkFile = File(updatesDir, "update.apk")
-                                    // Bounded overall download time: the connection's own
-                                    // connect/read timeouts only bound a single socket
-                                    // operation, not the whole transfer, so a slow trickle
-                                    // could otherwise stall here indefinitely. On timeout
-                                    // this throws TimeoutCancellationException, which the
-                                    // catch below turns into a visible FAIL instead of an
-                                    // unbounded hang.
-                                    withTimeout(APK_DOWNLOAD_TIMEOUT_MS) {
-                                        downloadApk(info.downloadUrl, apkFile)
-                                    }
-                                    updateStatus = "устанавливаю..."
-                                    val uri = FileProvider.getUriForFile(
-                                        context,
-                                        "org.nikitasever.tgproxycheck.nativeapp.fileprovider",
-                                        apkFile,
-                                    )
-                                    val installIntent = Intent(Intent.ACTION_VIEW).apply {
-                                        setDataAndType(uri, "application/vnd.android.package-archive")
-                                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                                    }
-                                    // Launched via the ActivityResult contract (not a bare
-                                    // startActivity) so installLauncher's callback above can
-                                    // reset updateStatus once the installer returns control
-                                    // to us - see the doc comment on installLauncher for why
-                                    // that's the actual fix for the indefinite hang.
-                                    installLauncher.launch(installIntent)
-                                } catch (e: Exception) {
-                                    updateStatus = "FAIL: ${e::class.simpleName}: ${e.message}"
+                                    return@Button
                                 }
-                            }
-                        },
-                    ) {
-                        Text("Обновить")
+                                scope.launch {
+                                    updateStatus = "скачиваю..."
+                                    try {
+                                        val updatesDir = File(context.cacheDir, "updates").apply { mkdirs() }
+                                        val apkFile = File(updatesDir, "update.apk")
+                                        // Bounded overall download time: the connection's own
+                                        // connect/read timeouts only bound a single socket
+                                        // operation, not the whole transfer, so a slow trickle
+                                        // could otherwise stall here indefinitely. On timeout
+                                        // this throws TimeoutCancellationException, which the
+                                        // catch below turns into a visible FAIL instead of an
+                                        // unbounded hang.
+                                        withTimeout(APK_DOWNLOAD_TIMEOUT_MS) {
+                                            downloadApk(info.downloadUrl, apkFile)
+                                        }
+                                        updateStatus = "устанавливаю..."
+                                        val uri = FileProvider.getUriForFile(
+                                            context,
+                                            "org.nikitasever.tgproxycheck.nativeapp.fileprovider",
+                                            apkFile,
+                                        )
+                                        val installIntent = Intent(Intent.ACTION_VIEW).apply {
+                                            setDataAndType(uri, "application/vnd.android.package-archive")
+                                            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                        }
+                                        // Launched via the ActivityResult contract (not a bare
+                                        // startActivity) so installLauncher's callback above can
+                                        // reset updateStatus once the installer returns control
+                                        // to us - see the doc comment on installLauncher for why
+                                        // that's the actual fix for the indefinite hang.
+                                        installLauncher.launch(installIntent)
+                                    } catch (e: Exception) {
+                                        updateStatus = "FAIL: ${e::class.simpleName}: ${e.message}"
+                                    }
+                                }
+                            },
+                        ) {
+                            Text("Обновить")
+                        }
                     }
                 }
             }
@@ -1275,22 +1414,54 @@ private fun XrayScreen() {
                 }
             }
             is XrayFetchState.Loaded -> {
+                val realityCount = s.configs.count { it.reality }
+                val scope = rememberCoroutineScope()
+                var isRefreshing by remember { mutableStateOf(false) }
+
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(bottom = 12.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        text = if (s.configs.isEmpty()) "Список пуст" else "VLESS / VMess (${s.configs.size}), Reality: $realityCount",
+                        color = TgOnSurfaceMuted,
+                        fontSize = 13.sp,
+                        modifier = Modifier.weight(1f),
+                    )
+                    Button(
+                        onClick = {
+                            scope.launch {
+                                isRefreshing = true
+                                load()
+                                isRefreshing = false
+                            }
+                        },
+                        enabled = !isRefreshing,
+                        shape = RoundedCornerShape(8.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = TgSurfaceVariant, contentColor = TgAccent),
+                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
+                    ) {
+                        if (isRefreshing) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(12.dp),
+                                color = TgAccent,
+                                strokeWidth = 2.dp,
+                            )
+                            Spacer(modifier = Modifier.width(6.dp))
+                        }
+                        Text("Обновить", fontSize = 12.sp)
+                    }
+                }
                 if (s.configs.isEmpty()) {
                     Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                         Text(
-                            text = "Список пуст. Попробуйте позже.",
+                            text = "Список пуст. Попробуйте обновить позже.",
                             color = TgOnSurfaceMuted,
                             textAlign = TextAlign.Center,
                         )
                     }
                 } else {
-                    val realityCount = s.configs.count { it.reality }
-                    Text(
-                        text = "VLESS / VMess (${s.configs.size}), из них Reality: $realityCount",
-                        color = TgOnSurfaceMuted,
-                        fontSize = 13.sp,
-                        modifier = Modifier.padding(bottom = 12.dp),
-                    )
                     LazyColumn(modifier = Modifier.fillMaxSize()) {
                         items(s.configs, key = { "${it.protocol}:${it.host}:${it.port}:${it.raw.hashCode()}" }) { config ->
                             XrayConfigCard(
